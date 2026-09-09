@@ -87,16 +87,17 @@ type Bot struct {
 	gate     Gate
 	conveyor Conveyor
 	duty     Duty
+	auth     Auth
 	logger   *slog.Logger
 }
 
 // NewBot wires a command bot. Any dependency may be nil; the matching command
 // then reports that it is unavailable instead of panicking.
-func NewBot(client *Client, sessions SessionLister, killer Killer, gate Gate, conveyor Conveyor, duty Duty, logger *slog.Logger) *Bot {
+func NewBot(client *Client, sessions SessionLister, killer Killer, gate Gate, conveyor Conveyor, duty Duty, auth Auth, logger *slog.Logger) *Bot {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Bot{client: client, sessions: sessions, killer: killer, gate: gate, conveyor: conveyor, duty: duty, logger: logger}
+	return &Bot{client: client, sessions: sessions, killer: killer, gate: gate, conveyor: conveyor, duty: duty, auth: auth, logger: logger}
 }
 
 // Start runs the long-poll loop until ctx is done and returns a channel closed
@@ -178,6 +179,10 @@ func (b *Bot) handle(ctx context.Context, update Update) {
 		reply = b.queue(ctx)
 	case "/take":
 		reply = b.take(ctx, arg)
+	case "/relogin":
+		reply = b.relogin(ctx)
+	case "/code":
+		reply = b.loginCode(ctx, arg)
 	case "/help", "/start":
 		reply = strings.Join([]string{
 			"/status — сессии и состояние очереди",
@@ -186,6 +191,8 @@ func (b *Bot) handle(ctx context.Context, update Update) {
 			"/pause — не брать новые карточки",
 			"/resume — снова брать",
 			"/kill <id> — снять сессию",
+			"/relogin — переподключить авторизацию Claude Code, если агенты встали",
+			"/code <код> — вернуть код со страницы входа",
 			"",
 			"вопрос дежурному агенту — тэгом (@" + b.tag() + ") или реплаем на моё сообщение",
 		}, "\n")

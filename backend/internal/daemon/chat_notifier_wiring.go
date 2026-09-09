@@ -121,7 +121,7 @@ func (c *chatNotifier) startBot(ctx context.Context, store *sqlite.Store, sessio
 	if duty != nil {
 		desk = dutyDesk{escalator: duty, answers: c.answers}
 	}
-	bot := telegram.NewBot(c.client, store, chatSessionKiller{sessions: sessions}, c.gate, c.conveyor, desk, c.logger)
+	bot := telegram.NewBot(c.client, store, chatSessionKiller{sessions: sessions}, c.gate, c.conveyor, desk, claudeAuthScript{}, c.logger)
 	return bot.Start(ctx)
 }
 

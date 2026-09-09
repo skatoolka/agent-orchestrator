@@ -286,7 +286,12 @@ func runBotWithConveyor(t *testing.T, api *fakeAPI, sessions SessionLister, kill
 
 func runBotWithDuty(t *testing.T, api *fakeAPI, sessions SessionLister, killer Killer, gate Gate, conveyor Conveyor, duty Duty) {
 	t.Helper()
-	bot := NewBot(newTestClient(t, api), sessions, killer, gate, conveyor, duty, discardLogger())
+	runBotWithAuth(t, api, sessions, killer, gate, conveyor, duty, nil)
+}
+
+func runBotWithAuth(t *testing.T, api *fakeAPI, sessions SessionLister, killer Killer, gate Gate, conveyor Conveyor, duty Duty, auth Auth) {
+	t.Helper()
+	bot := NewBot(newTestClient(t, api), sessions, killer, gate, conveyor, duty, auth, discardLogger())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := bot.Start(ctx)
 	t.Cleanup(func() {
@@ -700,5 +705,75 @@ func TestPublisherFallsBackWhenTheEditIsRefused(t *testing.T) {
 	got := waitForMessages(t, api, 1)
 	if len(got) != 1 || got[0] != "ответ дежурного" {
 		t.Fatalf("sent = %#v, want the answer as a new message", got)
+	}
+}
+
+
+// fakeAuth stands in for the login script: the bot must never need a tmux
+// server to be testable.
+type fakeAuth struct {
+	url    string
+	codes  []string
+	result string
+	err    error
+}
+
+func (a *fakeAuth) LoginStart(context.Context) (string, error) { return a.url, a.err }
+
+func (a *fakeAuth) LoginCode(_ context.Context, code string) (string, error) {
+	a.codes = append(a.codes, code)
+	return a.result, a.err
+}
+
+func TestBotReloginHandsBackTheLoginLink(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "/relogin")}}
+	auth := &fakeAuth{url: "https://claude.com/cai/oauth/authorize?code=true"}
+	runBotWithAuth(t, api, fakeSessions{}, &fakeKiller{}, &fakeGate{}, nil, nil, auth)
+
+	got := waitForMessages(t, api, 1)
+	if len(got) == 0 || !strings.Contains(got[0], auth.url) {
+		t.Fatalf("reply must carry the login link, got %#v", got)
+	}
+}
+
+func TestBotCodeForwardsTheCodeToTheLogin(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "/code abc#def")}}
+	auth := &fakeAuth{result: "Готово: авторизация обновлена"}
+	runBotWithAuth(t, api, fakeSessions{}, &fakeKiller{}, &fakeGate{}, nil, nil, auth)
+
+	got := waitForMessages(t, api, 1)
+	if len(auth.codes) != 1 || auth.codes[0] != "abc#def" {
+		t.Fatalf("codes = %v, want [abc#def]", auth.codes)
+	}
+	if len(got) == 0 || !strings.Contains(got[0], "обновлена") {
+		t.Fatalf("reply must report the result, got %#v", got)
+	}
+}
+
+// A code without a live login is the likely mistake — the chat is a place where
+// people paste things in the wrong order — and it must not read as a crash.
+func TestBotCodeWithoutArgumentExplainsUsage(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "/code")}}
+	auth := &fakeAuth{}
+	runBotWithAuth(t, api, fakeSessions{}, &fakeKiller{}, &fakeGate{}, nil, nil, auth)
+
+	got := waitForMessages(t, api, 1)
+	if len(auth.codes) != 0 {
+		t.Fatalf("nothing should reach the login without an argument: %v", auth.codes)
+	}
+	if len(got) == 0 || !strings.Contains(got[0], "/code") {
+		t.Fatalf("reply must show the usage, got %#v", got)
+	}
+}
+
+// Без настроенного релогина команда обязана ответить, а не молчать: молчание в
+// чате неотличимо от сломанного бота.
+func TestBotReloginWithoutAuthStillAnswers(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "/relogin")}}
+	runBotWithAuth(t, api, fakeSessions{}, &fakeKiller{}, &fakeGate{}, nil, nil, nil)
+
+	got := waitForMessages(t, api, 1)
+	if len(got) == 0 || !strings.Contains(got[0], "недоступен") {
+		t.Fatalf("reply must say the feature is off, got %#v", got)
 	}
 }
