@@ -88,16 +88,48 @@ type Bot struct {
 	conveyor Conveyor
 	duty     Duty
 	auth     Auth
-	logger   *slog.Logger
+	spawner  Spawner
+	links    Links
+	// desk remembers what the buttons of an open menu mean, and which question
+	// the bot is still waiting an answer to.
+	desk   *desk
+	logger *slog.Logger
 }
 
-// NewBot wires a command bot. Any dependency may be nil; the matching command
-// then reports that it is unavailable instead of panicking.
-func NewBot(client *Client, sessions SessionLister, killer Killer, gate Gate, conveyor Conveyor, duty Duty, auth Auth, logger *slog.Logger) *Bot {
+// Deps are the bot's collaborators. Any of them may be nil; the matching
+// command then reports that it is unavailable instead of panicking.
+type Deps struct {
+	Client   *Client
+	Sessions SessionLister
+	Killer   Killer
+	Gate     Gate
+	Conveyor Conveyor
+	Duty     Duty
+	Auth     Auth
+	Spawner  Spawner
+	Links    Links
+	Logger   *slog.Logger
+}
+
+// NewBot wires a command bot.
+func NewBot(deps Deps) *Bot {
+	logger := deps.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Bot{client: client, sessions: sessions, killer: killer, gate: gate, conveyor: conveyor, duty: duty, auth: auth, logger: logger}
+	return &Bot{
+		client:   deps.Client,
+		sessions: deps.Sessions,
+		killer:   deps.Killer,
+		gate:     deps.Gate,
+		conveyor: deps.Conveyor,
+		duty:     deps.Duty,
+		auth:     deps.Auth,
+		spawner:  deps.Spawner,
+		links:    deps.Links,
+		desk:     newDesk(),
+		logger:   logger,
+	}
 }
 
 // Start runs the long-poll loop until ctx is done and returns a channel closed
@@ -140,11 +172,22 @@ func (b *Bot) Start(ctx context.Context) <-chan struct{} {
 // are dropped without a reply: the bot's username is discoverable, its chat is
 // the authorization boundary.
 func (b *Bot) handle(ctx context.Context, update Update) {
+	if update.CallbackID != "" {
+		b.press(ctx, update)
+		return
+	}
 	if update.Text == "" {
 		return
 	}
 	if update.ChatID != b.client.ChatID() {
 		b.logger.Warn("telegram: ignoring command from unknown chat", "chat", update.ChatID)
+		return
+	}
+	// A reply to a question the bot asked belongs to that question — including
+	// one that starts with a slash, since a task brief may well open with a
+	// path or a command the agent is meant to run.
+	if pending, ok := b.desk.claimReply(update.ReplyToMessageID); ok {
+		b.spawnAnswer(ctx, pending.project, update.Text)
 		return
 	}
 	// Not a command means a human is talking — to the bot, or to the other
@@ -165,6 +208,15 @@ func (b *Bot) handle(ctx context.Context, update Update) {
 		return
 	}
 	command, arg := splitCommand(update.Text)
+	// The session menu answers with buttons, so it writes its own message
+	// instead of returning text into the shared reply path below.
+	if command == "/new" || command == "/spawn" {
+		text, keyboard := b.newSessionMenu(ctx, arg)
+		if _, err := b.client.SendWithKeyboard(ctx, text, keyboard); err != nil {
+			b.logger.Warn("telegram: reply failed", "command", command, "err", err)
+		}
+		return
+	}
 	var reply string
 	switch command {
 	case "/status":
@@ -185,6 +237,8 @@ func (b *Bot) handle(ctx context.Context, update Update) {
 		reply = b.loginCode(ctx, arg)
 	case "/help", "/start":
 		reply = strings.Join([]string{
+			"/new — новая сессия: проект, задача текстом или карточка из Ready — кнопками",
+			"/new <задача> — то же одной строкой",
 			"/status — сессии и состояние очереди",
 			"/queue — что лежит в Ready, по порядку",
 			"/take <номер> — взять конкретную задачу сейчас",

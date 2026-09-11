@@ -609,6 +609,19 @@ func appendRemoteControlFlags(cmd *[]string, sessionID string) {
 	*cmd = append(*cmd, "--remote-control")
 }
 
+// RemoteControlSessionName reports the name a session answers to in Claude —
+// the one shown at claude.ai/code and in the mobile app — or "" when this
+// deployment does not publish sessions there. It exists so surfaces that hand a
+// human a way into a session (the chat bot, for one) read the switch from the
+// same place the launcher does, instead of parsing the env a second time and
+// drifting from it.
+func RemoteControlSessionName(sessionID string) string {
+	if !remoteControlEnabled() {
+		return ""
+	}
+	return remoteControlName(sessionID)
+}
+
 // remoteControlEnabled reads the opt-in switch. Anything other than the
 // affirmative spellings below leaves Remote Control off, so a typo fails closed.
 func remoteControlEnabled() bool {

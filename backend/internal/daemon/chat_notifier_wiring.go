@@ -2,15 +2,20 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/claudecode"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/controllers"
 	"github.com/aoagents/agent-orchestrator/backend/internal/notify"
 	"github.com/aoagents/agent-orchestrator/backend/internal/notify/telegram"
 	trackerintake "github.com/aoagents/agent-orchestrator/backend/internal/observe/trackerintake"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 )
@@ -121,9 +126,99 @@ func (c *chatNotifier) startBot(ctx context.Context, store *sqlite.Store, sessio
 	if duty != nil {
 		desk = dutyDesk{escalator: duty, answers: c.answers}
 	}
-	bot := telegram.NewBot(c.client, store, chatSessionKiller{sessions: sessions}, c.gate, c.conveyor, desk, claudeAuthScript{}, c.logger)
+	bot := telegram.NewBot(telegram.Deps{
+		Client:   c.client,
+		Sessions: store,
+		Killer:   chatSessionKiller{sessions: sessions},
+		Gate:     c.gate,
+		Conveyor: c.conveyor,
+		Duty:     desk,
+		Auth:     claudeAuthScript{},
+		Spawner:  chatSpawner{store: store, sessions: sessions},
+		Links:    chatLinks(),
+		Logger:   c.logger,
+	})
 	return bot.Start(ctx)
 }
+
+// chatSpawner starts a session for a task typed into the chat. Unlike a claim,
+// there is no card behind it: the prompt is the whole task, which is what makes
+// this the path for work that occurs to someone away from the board.
+type chatSpawner struct {
+	store    *sqlite.Store
+	sessions *sessionsvc.Service
+}
+
+// Projects lists what the chat may spawn into. Archived projects are left out —
+// they are not places work goes any more.
+func (s chatSpawner) Projects(ctx context.Context) ([]telegram.Project, error) {
+	if s.store == nil {
+		return nil, fmt.Errorf("project list is unavailable")
+	}
+	records, err := s.store.ListProjects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	projects := make([]telegram.Project, 0, len(records))
+	for _, record := range records {
+		if !record.ArchivedAt.IsZero() {
+			continue
+		}
+		projects = append(projects, telegram.Project{ID: record.ID, Name: record.DisplayName})
+	}
+	return projects, nil
+}
+
+// Spawn starts a worker on the task. TerminateOnPRMerge matches what intake
+// does: a task that ends in a merged PR cleans up its own worktree instead of
+// lingering as a live session nobody will return to.
+func (s chatSpawner) Spawn(ctx context.Context, projectID, prompt string) (telegram.SpawnResult, error) {
+	if s.sessions == nil {
+		return telegram.SpawnResult{}, fmt.Errorf("session service is unavailable")
+	}
+	session, _, _, err := s.sessions.Spawn(ctx, ports.SpawnConfig{
+		ProjectID:          domain.ProjectID(projectID),
+		Kind:               domain.KindWorker,
+		Prompt:             prompt,
+		DisplayName:        chatDisplayName(prompt),
+		TerminateOnPRMerge: true,
+	})
+	if err != nil {
+		return telegram.SpawnResult{}, err
+	}
+	return telegram.SpawnResult{SessionID: string(session.ID)}, nil
+}
+
+// chatDisplayNameLen mirrors the daemon's own cap on a sidebar label.
+const chatDisplayNameLen = 20
+
+// chatDisplayName turns the first line of a task into the sidebar label, so a
+// session started from a phone is recognisable on the board.
+func chatDisplayName(prompt string) string {
+	first := strings.TrimSpace(prompt)
+	if line, _, ok := strings.Cut(first, "\n"); ok {
+		first = strings.TrimSpace(line)
+	}
+	runes := []rune(first)
+	if len(runes) > chatDisplayNameLen {
+		return strings.TrimSpace(string(runes[:chatDisplayNameLen]))
+	}
+	return first
+}
+
+// chatLinks tells the bot where a fresh session can be opened: the public
+// dashboard, and Claude when this deployment mirrors sessions there. Both come
+// from the deployment's environment, and an unset one simply drops a button.
+func chatLinks() telegram.Links {
+	return telegram.Links{
+		WebBase:           strings.TrimSpace(os.Getenv("AO_WEB_BASE_URL")),
+		RemoteControlName: claudecode.RemoteControlSessionName,
+		ClaudeURL:         strings.TrimSpace(os.Getenv(envClaudeCodeURL)),
+	}
+}
+
+// envClaudeCodeURL overrides where Remote Control sessions are driven from.
+const envClaudeCodeURL = "AO_CLAUDE_CODE_URL"
 
 // chatAnnounceAPI is the write half of the chat side-channel, mounted at
 // POST /api/v1/announce and reached by `ao announce`.

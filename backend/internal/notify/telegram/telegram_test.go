@@ -21,17 +21,25 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Disca
 // fakeAPI records sendMessage payloads and serves canned getUpdates batches.
 type fakeAPI struct {
 	mu       sync.Mutex
-	sent     []string
+	sent     []sentMessage
 	edits    []editCall
+	answered []string
 	editErr  bool
 	updates  [][]byte
 	updateIx int
+}
+
+// sentMessage is one sendMessage, with the buttons it carried.
+type sentMessage struct {
+	text   string
+	markup map[string]any
 }
 
 // editCall is one editMessageText the bot issued.
 type editCall struct {
 	messageID int64
 	text      string
+	markup    map[string]any
 }
 
 func (f *fakeAPI) server(t *testing.T) *httptest.Server {
@@ -41,25 +49,36 @@ func (f *fakeAPI) server(t *testing.T) *httptest.Server {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/sendMessage"):
 			var body struct {
-				ChatID string `json:"chat_id"`
-				Text   string `json:"text"`
+				ChatID string         `json:"chat_id"`
+				Text   string         `json:"text"`
+				Markup map[string]any `json:"reply_markup"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			f.mu.Lock()
-			f.sent = append(f.sent, body.Text)
+			f.sent = append(f.sent, sentMessage{text: body.Text, markup: body.Markup})
 			id := len(f.sent)
 			f.mu.Unlock()
 			_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":true,"result":{"message_id":%d}}`, id)))
+		case strings.HasSuffix(r.URL.Path, "/answerCallbackQuery"):
+			var body struct {
+				CallbackID string `json:"callback_query_id"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.mu.Lock()
+			f.answered = append(f.answered, body.CallbackID)
+			f.mu.Unlock()
+			_, _ = w.Write([]byte(`{"ok":true}`))
 		case strings.HasSuffix(r.URL.Path, "/editMessageText"):
 			var body struct {
-				MessageID int64  `json:"message_id"`
-				Text      string `json:"text"`
+				MessageID int64          `json:"message_id"`
+				Text      string         `json:"text"`
+				Markup    map[string]any `json:"reply_markup"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			f.mu.Lock()
 			refuse := f.editErr
 			if !refuse {
-				f.edits = append(f.edits, editCall{messageID: body.MessageID, text: body.Text})
+				f.edits = append(f.edits, editCall{messageID: body.MessageID, text: body.Text, markup: body.Markup})
 			}
 			f.mu.Unlock()
 			if refuse {
@@ -91,7 +110,25 @@ func (f *fakeAPI) server(t *testing.T) *httptest.Server {
 func (f *fakeAPI) messages() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]string(nil), f.sent...)
+	texts := make([]string, 0, len(f.sent))
+	for _, message := range f.sent {
+		texts = append(texts, message.text)
+	}
+	return texts
+}
+
+// posts returns the sent messages with their buttons.
+func (f *fakeAPI) posts() []sentMessage {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]sentMessage(nil), f.sent...)
+}
+
+// acknowledgements returns the callback ids the bot answered.
+func (f *fakeAPI) acknowledgements() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.answered...)
 }
 
 func (f *fakeAPI) rewrites() []editCall {
@@ -291,7 +328,25 @@ func runBotWithDuty(t *testing.T, api *fakeAPI, sessions SessionLister, killer K
 
 func runBotWithAuth(t *testing.T, api *fakeAPI, sessions SessionLister, killer Killer, gate Gate, conveyor Conveyor, duty Duty, auth Auth) {
 	t.Helper()
-	bot := NewBot(newTestClient(t, api), sessions, killer, gate, conveyor, duty, auth, discardLogger())
+	runBotWithDeps(t, Deps{
+		Client:   newTestClient(t, api),
+		Sessions: sessions,
+		Killer:   killer,
+		Gate:     gate,
+		Conveyor: conveyor,
+		Duty:     duty,
+		Auth:     auth,
+	})
+}
+
+// runBotWithDeps starts a bot from an explicit dependency set, for the flows
+// that need one the telescoping helpers above do not carry.
+func runBotWithDeps(t *testing.T, deps Deps) {
+	t.Helper()
+	if deps.Logger == nil {
+		deps.Logger = discardLogger()
+	}
+	bot := NewBot(deps)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := bot.Start(ctx)
 	t.Cleanup(func() {
@@ -707,7 +762,6 @@ func TestPublisherFallsBackWhenTheEditIsRefused(t *testing.T) {
 		t.Fatalf("sent = %#v, want the answer as a new message", got)
 	}
 }
-
 
 // fakeAuth stands in for the login script: the bot must never need a tmux
 // server to be testable.

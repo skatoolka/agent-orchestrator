@@ -108,10 +108,37 @@ func (c *Client) Send(ctx context.Context, text string) error {
 // needs: an answer that overwrites the message promising it keeps one question
 // to one line in the chat.
 func (c *Client) SendMessage(ctx context.Context, text string) (int64, error) {
+	return c.send(ctx, text, nil)
+}
+
+// SendWithKeyboard posts a message carrying inline buttons. A menu the human
+// taps beats a command they have to remember the syntax of, and the buttons are
+// also the only way to offer a link and an action in the same breath.
+func (c *Client) SendWithKeyboard(ctx context.Context, text string, keyboard Keyboard) (int64, error) {
+	return c.send(ctx, text, keyboard.markup())
+}
+
+// Ask posts a message Telegram pre-opens a reply box for, so the human types
+// the answer into the right place instead of into a fresh message the bot has
+// no way to tie back to the question. mention is the @name the prompt is meant
+// for: with one, the reply box opens for that person alone, which is what keeps
+// a group chat from being told to answer somebody else's question.
+func (c *Client) Ask(ctx context.Context, text, mention string) (int64, error) {
+	markup := map[string]any{"force_reply": true}
+	if strings.TrimSpace(mention) != "" {
+		markup["selective"] = true
+	}
+	return c.send(ctx, text, markup)
+}
+
+func (c *Client) send(ctx context.Context, text string, markup any) (int64, error) {
 	payload := map[string]any{
 		"chat_id":                  c.chatID,
 		"text":                     text,
 		"disable_web_page_preview": true,
+	}
+	if markup != nil {
+		payload["reply_markup"] = markup
 	}
 	var resp struct {
 		OK     bool `json:"ok"`
@@ -129,15 +156,85 @@ func (c *Client) SendMessage(ctx context.Context, text string) (int64, error) {
 	return resp.Result.MessageID, nil
 }
 
+// InlineButton is one button under a message: either a callback button, which
+// sends Data back to the bot, or a link button, which opens URL. Exactly one of
+// the two is set.
+type InlineButton struct {
+	Text string
+	Data string
+	URL  string
+}
+
+// Keyboard is the rows of buttons under a message.
+type Keyboard [][]InlineButton
+
+// markup renders the keyboard as Telegram's reply_markup, or nil when there is
+// nothing to show — an empty inline_keyboard is rejected by the API.
+func (k Keyboard) markup() any {
+	rows := make([][]map[string]any, 0, len(k))
+	for _, row := range k {
+		rendered := make([]map[string]any, 0, len(row))
+		for _, button := range row {
+			switch {
+			case button.URL != "":
+				rendered = append(rendered, map[string]any{"text": button.Text, "url": button.URL})
+			case button.Data != "":
+				rendered = append(rendered, map[string]any{"text": button.Text, "callback_data": button.Data})
+			}
+		}
+		if len(rendered) > 0 {
+			rows = append(rows, rendered)
+		}
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	return map[string]any{"inline_keyboard": rows}
+}
+
+// AnswerCallback closes the spinner Telegram shows on a pressed button. An
+// unanswered press keeps spinning for seconds and reads as a dead bot, so this
+// is sent even when the answer is empty.
+func (c *Client) AnswerCallback(ctx context.Context, callbackID, text string) error {
+	payload := map[string]any{"callback_query_id": callbackID}
+	if text != "" {
+		payload["text"] = text
+	}
+	var resp struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+	if err := c.call(ctx, "answerCallbackQuery", payload, &resp); err != nil {
+		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("telegram: answerCallbackQuery rejected: %s", resp.Description)
+	}
+	return nil
+}
+
 // Edit replaces the text of a message the bot sent earlier. Telegram refuses an
 // edit that changes nothing and one on a message older than 48 hours, so the
 // caller must be ready to fall back to a fresh message.
 func (c *Client) Edit(ctx context.Context, messageID int64, text string) error {
+	return c.EditWithKeyboard(ctx, messageID, text, nil)
+}
+
+// EditWithKeyboard rewrites a message and replaces its buttons. A menu that
+// walks through steps edits itself rather than posting a message per step: the
+// chat keeps one card for one task instead of a trail of dead menus.
+func (c *Client) EditWithKeyboard(ctx context.Context, messageID int64, text string, keyboard Keyboard) error {
 	payload := map[string]any{
 		"chat_id":                  c.chatID,
 		"message_id":               messageID,
 		"text":                     text,
 		"disable_web_page_preview": true,
+		// An edit that omits reply_markup leaves the old buttons in place, so a
+		// step with no buttons must say so explicitly.
+		"reply_markup": map[string]any{"inline_keyboard": [][]map[string]any{}},
+	}
+	if markup := keyboard.markup(); markup != nil {
+		payload["reply_markup"] = markup
 	}
 	var resp struct {
 		OK          bool   `json:"ok"`
@@ -197,6 +294,21 @@ type Update struct {
 	// ReplyToText is what is being replied to, quoted back to the agent so it
 	// knows which of its messages the human means.
 	ReplyToText string
+	// ReplyToMessageID identifies the message being answered. A reply to a
+	// question the bot itself asked belongs to that question, not to the agent
+	// on duty, and the id is the only thing that tells the two apart.
+	ReplyToMessageID int64
+	// FromUsername is the @name of whoever produced the update, used to open a
+	// reply box for that person alone.
+	FromUsername string
+	// CallbackID is non-empty when the update is a button press. It must be
+	// answered, or Telegram spins on the button.
+	CallbackID string
+	// CallbackData is the payload of the pressed button.
+	CallbackData string
+	// MessageID is the message carrying the pressed button, which the bot edits
+	// in place so a menu advances instead of piling up.
+	MessageID int64
 }
 
 // GetUpdates long-polls for messages after offset. timeout is the server-side
@@ -208,30 +320,46 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout time.Dura
 		seconds = 1
 	}
 	payload := map[string]any{
-		"timeout":         seconds,
-		"allowed_updates": []string{"message"},
+		"timeout": seconds,
+		// Button presses arrive as a separate update type: a poll that does not
+		// ask for them leaves every button dead.
+		"allowed_updates": []string{"message", "callback_query"},
 	}
 	if offset > 0 {
 		payload["offset"] = offset
 	}
+	type messagePayload struct {
+		MessageID int64  `json:"message_id"`
+		Text      string `json:"text"`
+		From      *struct {
+			Username string `json:"username"`
+		} `json:"from"`
+		Chat struct {
+			ID   json.Number `json:"id"`
+			Type string      `json:"type"`
+		} `json:"chat"`
+		ReplyTo *struct {
+			MessageID int64  `json:"message_id"`
+			Text      string `json:"text"`
+			From      *struct {
+				ID    int64 `json:"id"`
+				IsBot bool  `json:"is_bot"`
+			} `json:"from"`
+		} `json:"reply_to_message"`
+	}
 	var resp struct {
 		OK     bool `json:"ok"`
 		Result []struct {
-			UpdateID int64 `json:"update_id"`
-			Message  *struct {
-				Text string `json:"text"`
-				Chat struct {
-					ID   json.Number `json:"id"`
-					Type string      `json:"type"`
-				} `json:"chat"`
-				ReplyTo *struct {
-					Text string `json:"text"`
-					From *struct {
-						ID    int64 `json:"id"`
-						IsBot bool  `json:"is_bot"`
-					} `json:"from"`
-				} `json:"reply_to_message"`
-			} `json:"message"`
+			UpdateID      int64           `json:"update_id"`
+			Message       *messagePayload `json:"message"`
+			CallbackQuery *struct {
+				ID   string `json:"id"`
+				Data string `json:"data"`
+				From *struct {
+					Username string `json:"username"`
+				} `json:"from"`
+				Message *messagePayload `json:"message"`
+			} `json:"callback_query"`
 		} `json:"result"`
 		Description string `json:"description"`
 	}
@@ -248,6 +376,23 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout time.Dura
 	}
 	updates := make([]Update, 0, len(resp.Result))
 	for _, item := range resp.Result {
+		if query := item.CallbackQuery; query != nil {
+			update := Update{
+				ID:           item.UpdateID,
+				CallbackID:   query.ID,
+				CallbackData: strings.TrimSpace(query.Data),
+			}
+			if query.From != nil {
+				update.FromUsername = query.From.Username
+			}
+			if message := query.Message; message != nil {
+				update.ChatID = message.Chat.ID.String()
+				update.ChatType = message.Chat.Type
+				update.MessageID = message.MessageID
+			}
+			updates = append(updates, update)
+			continue
+		}
 		if item.Message == nil {
 			// Still surface the id: the offset must advance past updates AO
 			// does not act on, or the same batch is re-read forever.
@@ -255,13 +400,18 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout time.Dura
 			continue
 		}
 		update := Update{
-			ID:       item.UpdateID,
-			ChatID:   item.Message.Chat.ID.String(),
-			ChatType: item.Message.Chat.Type,
-			Text:     strings.TrimSpace(item.Message.Text),
+			ID:        item.UpdateID,
+			ChatID:    item.Message.Chat.ID.String(),
+			ChatType:  item.Message.Chat.Type,
+			MessageID: item.Message.MessageID,
+			Text:      strings.TrimSpace(item.Message.Text),
+		}
+		if from := item.Message.From; from != nil {
+			update.FromUsername = from.Username
 		}
 		if reply := item.Message.ReplyTo; reply != nil {
 			update.ReplyToText = strings.TrimSpace(reply.Text)
+			update.ReplyToMessageID = reply.MessageID
 			if reply.From != nil {
 				update.ReplyToFromID = reply.From.ID
 				update.ReplyToFromIsBot = reply.From.IsBot
