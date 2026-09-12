@@ -116,7 +116,7 @@ func (i intakeConveyor) Claim(ctx context.Context, ref string) (telegram.ClaimRe
 // service exist, since /status and /kill need both. Returns nil when chat is
 // not configured, which the daemon's shutdown path treats as "nothing to wait
 // for".
-func (c *chatNotifier) startBot(ctx context.Context, store *sqlite.Store, sessions *sessionsvc.Service, duty *orchestratorEscalator) <-chan struct{} {
+func (c *chatNotifier) startBot(ctx context.Context, store *sqlite.Store, sessions *sessionsvc.Service, duty *orchestratorEscalator, runtime paneReader) <-chan struct{} {
 	if c == nil || c.client == nil {
 		return nil
 	}
@@ -135,6 +135,7 @@ func (c *chatNotifier) startBot(ctx context.Context, store *sqlite.Store, sessio
 		Duty:     desk,
 		Auth:     claudeAuthScript{},
 		Spawner:  chatSpawner{store: store, sessions: sessions},
+		Remote:   chatRemoteControlFor(store, sessions, runtime, c.logger),
 		Links:    chatLinks(),
 		Logger:   c.logger,
 	})
@@ -204,6 +205,17 @@ func chatDisplayName(prompt string) string {
 		return strings.TrimSpace(string(runes[:chatDisplayNameLen]))
 	}
 	return first
+}
+
+// chatRemoteControlFor wires the Remote Control surface, or returns a nil
+// interface when this deployment does not publish sessions to Claude at all:
+// with Remote Control off there is no link to lose, and a /rc that reported on
+// one would be inventing a problem.
+func chatRemoteControlFor(store *sqlite.Store, sessions *sessionsvc.Service, runtime paneReader, logger *slog.Logger) telegram.RemoteControl {
+	if claudecode.RemoteControlSessionName("probe") == "" {
+		return nil
+	}
+	return chatRemoteControl{roster: store, inbox: sessions, runtime: runtime, logger: logger}
 }
 
 // chatLinks tells the bot where a fresh session can be opened: the public

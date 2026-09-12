@@ -89,6 +89,7 @@ type Bot struct {
 	duty     Duty
 	auth     Auth
 	spawner  Spawner
+	remote   RemoteControl
 	links    Links
 	// desk remembers what the buttons of an open menu mean, and which question
 	// the bot is still waiting an answer to.
@@ -107,6 +108,7 @@ type Deps struct {
 	Duty     Duty
 	Auth     Auth
 	Spawner  Spawner
+	Remote   RemoteControl
 	Links    Links
 	Logger   *slog.Logger
 }
@@ -126,6 +128,7 @@ func NewBot(deps Deps) *Bot {
 		duty:     deps.Duty,
 		auth:     deps.Auth,
 		spawner:  deps.Spawner,
+		remote:   deps.Remote,
 		links:    deps.Links,
 		desk:     newDesk(),
 		logger:   logger,
@@ -217,6 +220,15 @@ func (b *Bot) handle(ctx context.Context, update Update) {
 		}
 		return
 	}
+	// Bare /rc reports the sessions that lost the link and offers each as a
+	// button; with an id it repairs that one.
+	if command == "/rc" && strings.TrimSpace(arg) == "" {
+		text, keyboard := b.remoteControlReport(ctx)
+		if _, err := b.client.SendWithKeyboard(ctx, text, keyboard); err != nil {
+			b.logger.Warn("telegram: reply failed", "command", command, "err", err)
+		}
+		return
+	}
 	var reply string
 	switch command {
 	case "/status":
@@ -231,6 +243,8 @@ func (b *Bot) handle(ctx context.Context, update Update) {
 		reply = b.queue(ctx)
 	case "/take":
 		reply = b.take(ctx, arg)
+	case "/rc":
+		reply = b.reconnect(ctx, arg)
 	case "/relogin":
 		reply = b.relogin(ctx)
 	case "/code":
@@ -245,6 +259,7 @@ func (b *Bot) handle(ctx context.Context, update Update) {
 			"/pause — не брать новые карточки",
 			"/resume — снова брать",
 			"/kill <id> — снять сессию",
+			"/rc — у кого отвалился Remote Control; /rc <id> — переподключить",
 			"/relogin — переподключить авторизацию Claude Code, если агенты встали",
 			"/code <код> — вернуть код со страницы входа",
 			"",

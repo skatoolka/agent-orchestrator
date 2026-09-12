@@ -380,3 +380,152 @@ func TestSpawnFailureIsReportedInTheChat(t *testing.T) {
 		t.Fatalf("a refused spawn must say why:\n%s", posts[0].text)
 	}
 }
+
+// fakeRemote answers the bot with canned Remote Control states.
+type fakeRemote struct {
+	mu        sync.Mutex
+	states    []RemoteControlState
+	after     RemoteControlState
+	reconnect []string
+	err       error
+}
+
+func (f *fakeRemote) States(context.Context) ([]RemoteControlState, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.states, nil
+}
+
+func (f *fakeRemote) Reconnect(_ context.Context, sessionID string) (RemoteControlState, error) {
+	if f.err != nil {
+		return RemoteControlState{}, f.err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reconnect = append(f.reconnect, sessionID)
+	state := f.after
+	state.SessionID = sessionID
+	return state, nil
+}
+
+func (f *fakeRemote) repaired() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.reconnect...)
+}
+
+func TestRCListsTheBrokenSessionsWithARepairButton(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "/rc")}}
+	remote := &fakeRemote{states: []RemoteControlState{
+		{SessionID: "vibeli-1", Known: true, Connected: true},
+		{SessionID: "vibeli-2", Known: true, Connected: false, Detail: "OAuth token unavailable"},
+		{SessionID: "vibeli-3"},
+	}}
+	runBotWithDeps(t, Deps{Client: newTestClient(t, api), Remote: remote, Links: testLinks()})
+
+	post := waitForPosts(t, api, 1)[0]
+	if !strings.Contains(post.text, "vibeli-2") || !strings.Contains(post.text, "OAuth token unavailable") {
+		t.Fatalf("the report must name the broken session and why:\n%s", post.text)
+	}
+	if strings.Contains(post.text, "vibeli-1") {
+		t.Fatalf("a connected session is not a problem to list:\n%s", post.text)
+	}
+	// A quiet pane is neither an outage nor a clean bill of health, and the
+	// report must not pass it off as either.
+	if !strings.Contains(post.text, "молчат 1") {
+		t.Fatalf("the report must account for the quiet pane:\n%s", post.text)
+	}
+	if _, ok := buttons(post.markup)["🔌 vibeli-2"]; !ok {
+		t.Fatalf("the broken session needs a repair button: %v", buttons(post.markup))
+	}
+}
+
+func TestRCSaysSoWhenNothingIsBroken(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "/rc")}}
+	remote := &fakeRemote{states: []RemoteControlState{{SessionID: "vibeli-1", Known: true, Connected: true}}}
+	runBotWithDeps(t, Deps{Client: newTestClient(t, api), Remote: remote, Links: testLinks()})
+
+	post := waitForPosts(t, api, 1)[0]
+	if !strings.Contains(post.text, "обрывов Remote Control нет") {
+		t.Fatalf("a healthy fleet must be reported as such:\n%s", post.text)
+	}
+}
+
+func TestRCWithAnIDRepairsThatSession(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "/rc vibeli-2")}}
+	remote := &fakeRemote{after: RemoteControlState{Known: true, Connected: true}}
+	runBotWithDeps(t, Deps{Client: newTestClient(t, api), Remote: remote, Links: testLinks()})
+
+	post := waitForPosts(t, api, 1)[0]
+	if got := remote.repaired(); len(got) != 1 || got[0] != "vibeli-2" {
+		t.Fatalf("repaired = %v, want [vibeli-2]", got)
+	}
+	if !strings.Contains(post.text, "поднят") {
+		t.Fatalf("a successful reconnect must say so:\n%s", post.text)
+	}
+}
+
+func TestRCDoesNotClaimSuccessOnASilentPane(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "/rc vibeli-2")}}
+	// Command delivered, pane said nothing: the honest answer names that.
+	remote := &fakeRemote{after: RemoteControlState{Known: false}}
+	runBotWithDeps(t, Deps{Client: newTestClient(t, api), Remote: remote, Links: testLinks()})
+
+	post := waitForPosts(t, api, 1)[0]
+	if strings.Contains(post.text, "поднят") {
+		t.Fatalf("delivery is not a repair:\n%s", post.text)
+	}
+	if !strings.Contains(post.text, "панель молчит") {
+		t.Fatalf("the answer must say the pane stayed quiet:\n%s", post.text)
+	}
+}
+
+func TestRCPointsAtReloginWhenTheLoginIsTheProblem(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "/rc vibeli-2")}}
+	remote := &fakeRemote{after: RemoteControlState{Known: true, Connected: false, Detail: "OAuth token unavailable"}}
+	runBotWithDeps(t, Deps{Client: newTestClient(t, api), Remote: remote, Links: testLinks()})
+
+	post := waitForPosts(t, api, 1)[0]
+	if !strings.Contains(post.text, "/relogin") {
+		t.Fatalf("a failed reconnect must point at the next thing to try:\n%s", post.text)
+	}
+}
+
+func TestSessionCardCarriesARepairButton(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "/new почини логин")}}
+	spawner := &fakeSpawner{projects: []Project{{ID: "vibeli"}}}
+	remote := &fakeRemote{after: RemoteControlState{Known: true, Connected: true}}
+	runBotWithDeps(t, Deps{Client: newTestClient(t, api), Spawner: spawner, Remote: remote, Links: testLinks()})
+
+	card := waitForPosts(t, api, 1)[0]
+	press := findButton(t, card.markup, "переподключить")
+	api.mu.Lock()
+	api.updates = append(api.updates, callbackBatch(2, "42", press, 1))
+	api.mu.Unlock()
+
+	// The repair answers in a new message: rewriting the card would cost it the
+	// links into the session.
+	posts := waitForPosts(t, api, 2)
+	if got := remote.repaired(); len(got) != 1 || got[0] != "vibeli-42" {
+		t.Fatalf("repaired = %v, want the card's own session", got)
+	}
+	if !strings.Contains(posts[1].text, "поднят") {
+		t.Fatalf("the repair must report its outcome:\n%s", posts[1].text)
+	}
+	if len(api.rewrites()) != 0 {
+		t.Fatalf("the session card must keep its links, edits = %v", api.rewrites())
+	}
+}
+
+func TestRCWithoutTheSurfaceStillAnswers(t *testing.T) {
+	// Remote Control off for this deployment: the bot must say so rather than
+	// go quiet.
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "/rc")}}
+	runBotWithDeps(t, Deps{Client: newTestClient(t, api), Links: testLinks()})
+
+	post := waitForPosts(t, api, 1)[0]
+	if !strings.Contains(post.text, "недоступно") {
+		t.Fatalf("silence is indistinguishable from a broken bot:\n%s", post.text)
+	}
+}

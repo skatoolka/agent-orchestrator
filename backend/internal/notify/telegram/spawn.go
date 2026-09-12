@@ -100,6 +100,10 @@ const (
 	actionQueue   = "queue"   // show what is waiting in Ready
 	actionTake    = "take"    // claim one card from Ready
 	actionCancel  = "cancel"  // close the menu
+	// actionReconnect repairs one session's Remote Control link. It rides on a
+	// session card rather than the menu, since that is where a human is when
+	// they notice the link is gone.
+	actionReconnect = "reconnect"
 )
 
 // action is what one button does when pressed.
@@ -384,7 +388,13 @@ func (b *Bot) sessionKeyboard(sessionID string) Keyboard {
 	if row := b.links.buttons(sessionID); len(row) > 0 {
 		keyboard = append(keyboard, row)
 	}
-	return append(keyboard, []InlineButton{{Text: "+ ещё сессия", Data: b.desk.register(action{kind: actionNew})}})
+	tail := []InlineButton{{Text: "+ ещё сессия", Data: b.desk.register(action{kind: actionNew})}}
+	// The card outlives the spawn, and a link to Claude that dropped an hour
+	// later is repaired from right here.
+	if name, _ := b.links.remoteControl(sessionID); name != "" {
+		tail = append([]InlineButton{{Text: "🔌 переподключить", Data: b.desk.register(action{kind: actionReconnect, ref: sessionID})}}, tail...)
+	}
+	return append(keyboard, tail)
 }
 
 // projectLabel is the button text for a project.
@@ -455,6 +465,13 @@ func (b *Bot) press(ctx context.Context, update Update) {
 		b.rewrite(ctx, update.MessageID, "⏳ беру "+act.ref+"…", nil)
 		text, keyboard := b.takeFromQueue(ctx, act.project, act.ref)
 		b.rewrite(ctx, update.MessageID, text, keyboard)
+	case actionReconnect:
+		// A fresh message rather than a rewrite: the card this button sits on
+		// carries the links into the session, and repairing the Claude side
+		// must not cost them.
+		if _, err := b.client.SendMessage(ctx, b.reconnect(ctx, act.ref)); err != nil {
+			b.logger.Warn("telegram: reply failed", "command", "/rc", "err", err)
+		}
 	case actionCancel:
 		b.rewrite(ctx, update.MessageID, "отменено", nil)
 	}

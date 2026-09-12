@@ -270,7 +270,7 @@ func Run() error {
 	// the addressee of a human's question in chat, so it is built once here and
 	// handed to both.
 	dutyEscalator := newOrchestratorEscalator(store, sessionSvc, log)
-	lcStack.chatBotDone = chatNotifier.startBot(ctx, store, sessionSvc, dutyEscalator)
+	lcStack.chatBotDone = chatNotifier.startBot(ctx, store, sessionSvc, dutyEscalator, runtimeAdapter)
 
 	agentSvc := agentsvc.NewWithDeps(agentsvc.Deps{Cache: store, Discoverer: modelcatalog.Discoverer{}, Projects: store})
 	go func() {
