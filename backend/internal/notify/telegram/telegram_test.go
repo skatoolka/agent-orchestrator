@@ -29,9 +29,12 @@ type fakeAPI struct {
 	updateIx int
 }
 
-// sentMessage is one sendMessage, with the buttons it carried.
+// sentMessage is one sendMessage, with the buttons it carried and the chat it
+// was addressed to. The chat matters as much as the text: a reply with the
+// right words in the wrong chat is invisible to the person who asked.
 type sentMessage struct {
 	text   string
+	chat   string
 	markup map[string]any
 }
 
@@ -55,7 +58,7 @@ func (f *fakeAPI) server(t *testing.T) *httptest.Server {
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			f.mu.Lock()
-			f.sent = append(f.sent, sentMessage{text: body.Text, markup: body.Markup})
+			f.sent = append(f.sent, sentMessage{text: body.Text, chat: body.ChatID, markup: body.Markup})
 			id := len(f.sent)
 			f.mu.Unlock()
 			_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":true,"result":{"message_id":%d}}`, id)))
@@ -140,6 +143,13 @@ func (f *fakeAPI) rewrites() []editCall {
 func newTestClient(t *testing.T, api *fakeAPI) *Client {
 	t.Helper()
 	return New(Config{Token: "tok", ChatID: "42", APIBase: api.server(t).URL})
+}
+
+// newTestClientWithExtras is newTestClient plus the chats allowed besides the
+// main one (AO_TELEGRAM_EXTRA_CHATS in a deployment).
+func newTestClientWithExtras(t *testing.T, api *fakeAPI, extras string) *Client {
+	t.Helper()
+	return New(Config{Token: "tok", ChatID: "42", ExtraChats: extras, APIBase: api.server(t).URL})
 }
 
 func TestSendPostsToTheConfiguredChat(t *testing.T) {
@@ -412,6 +422,80 @@ func TestBotIgnoresCommandsFromOtherChats(t *testing.T) {
 	}
 	if got := api.messages(); len(got) != 0 {
 		t.Fatalf("an unknown chat must not even get a reply: %#v", got)
+	}
+}
+
+// Личка оператора с ботом: он пишет туда, а не в общий чат конвейера. До
+// AO_TELEGRAM_EXTRA_CHATS бот такие сообщения молча выбрасывал — апдейты он
+// получал, в лог писал «ignoring command from unknown chat», а человек видел
+// бота, который не отвечает ничем и никогда.
+func TestBotAnswersAnExtraChatInThatChat(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{privateBatch(1, "777", "/kill vibeli-3")}}
+	killer := &fakeKiller{}
+	runBotWithDeps(t, Deps{
+		Client:   newTestClientWithExtras(t, api, "777"),
+		Sessions: fakeSessions{},
+		Killer:   killer,
+		Gate:     &fakeGate{},
+	})
+
+	waitForMessages(t, api, 1)
+	if got := killer.list(); len(got) != 1 || got[0] != "vibeli-3" {
+		t.Fatalf("команда из разрешённой лички обязана исполниться, killed=%v", got)
+	}
+	// Главное в этом тесте — адрес, а не факт ответа: раньше chat_id брался из
+	// конфига, и ответ уехал бы в общий чат «42», где спросивший его не увидит.
+	posts := api.posts()
+	if len(posts) != 1 || posts[0].chat != "777" {
+		t.Fatalf("ответ обязан уйти в чат вопроса, got=%#v", posts)
+	}
+}
+
+// Список — чтобы добавить человека без пересборки демона; пробелы и хвостовая
+// запятая в переменной окружения неизбежны, и пустой id из них получаться не
+// должен: он совпал бы с пустым ChatID у апдейта без чата.
+func TestBotAllowsEveryChatInTheList(t *testing.T) {
+	client := New(Config{Token: "tok", ChatID: "42", ExtraChats: " 777 , 888 ,", APIBase: "http://example.invalid"})
+	for _, chat := range []string{"42", "777", "888"} {
+		if !client.AllowsChat(chat) {
+			t.Fatalf("чат %s обязан быть разрешён", chat)
+		}
+	}
+	for _, chat := range []string{"999", ""} {
+		if client.AllowsChat(chat) {
+			t.Fatalf("чат %q разрешать нельзя", chat)
+		}
+	}
+}
+
+// Уведомления конвейера — его собственная инициатива, у них нет «чата вопроса».
+// Они обязаны идти в главный чат, даже когда разрешены другие: иначе карточки и
+// эскалации начали бы приходить туда, где их никто не ждёт.
+func TestConveyorNotificationsStayInTheMainChat(t *testing.T) {
+	api := &fakeAPI{}
+	client := newTestClientWithExtras(t, api, "777")
+	if err := client.Send(context.Background(), "карточка взята"); err != nil {
+		t.Fatal(err)
+	}
+	posts := api.posts()
+	if len(posts) != 1 || posts[0].chat != "42" {
+		t.Fatalf("уведомление обязано уйти в главный чат, got=%#v", posts)
+	}
+}
+
+// Чат из контекста не берётся на веру: если туда попадёт чужой id (из апдейта,
+// который мы отбросили, или по ошибке вызывающего), ответ уйдёт в главный чат,
+// а не чужому. Адресация подчиняется тому же правилу, что и допуск команд.
+func TestUnknownChatInContextFallsBackToTheMainChat(t *testing.T) {
+	api := &fakeAPI{}
+	client := newTestClientWithExtras(t, api, "777")
+	ctx := WithChat(context.Background(), "999")
+	if err := client.Send(ctx, "ответ"); err != nil {
+		t.Fatal(err)
+	}
+	posts := api.posts()
+	if len(posts) != 1 || posts[0].chat != "42" {
+		t.Fatalf("чужой чат из контекста доверять нельзя, got=%#v", posts)
 	}
 }
 

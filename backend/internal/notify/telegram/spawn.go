@@ -425,10 +425,11 @@ func (b *Bot) press(ctx context.Context, update Update) {
 	// The same rule as for commands: the configured chat is the authorization
 	// boundary, and an unknown one gets no answer at all — not even the
 	// acknowledgement that stops Telegram's spinner.
-	if update.ChatID != b.client.ChatID() {
+	if !b.client.AllowsChat(update.ChatID) {
 		b.logger.Warn("telegram: ignoring button press from unknown chat", "chat", update.ChatID)
 		return
 	}
+	ctx = WithChat(ctx, update.ChatID)
 	act, ok := b.desk.lookup(update.CallbackData)
 	if !ok {
 		// A daemon restart, or a menu left open for hours: the button's meaning

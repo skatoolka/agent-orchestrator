@@ -171,9 +171,15 @@ func (b *Bot) Start(ctx context.Context) <-chan struct{} {
 	return done
 }
 
-// handle runs one command. Updates from any chat other than the configured one
-// are dropped without a reply: the bot's username is discoverable, its chat is
-// the authorization boundary.
+// handle runs one command. Updates from a chat that is not allowed are dropped
+// without a reply: the bot's username is discoverable, so the chat is the
+// authorization boundary.
+//
+// Allowed is the main chat plus AO_TELEGRAM_EXTRA_CHATS — an operator's direct
+// message with the bot, typically. The reply goes back to the chat the update
+// came from (WithChat below), and that is the whole point: the answer to a
+// question asked in a direct message used to be addressed to the main chat,
+// where the person who asked would never see it.
 func (b *Bot) handle(ctx context.Context, update Update) {
 	if update.CallbackID != "" {
 		b.press(ctx, update)
@@ -182,10 +188,11 @@ func (b *Bot) handle(ctx context.Context, update Update) {
 	if update.Text == "" {
 		return
 	}
-	if update.ChatID != b.client.ChatID() {
+	if !b.client.AllowsChat(update.ChatID) {
 		b.logger.Warn("telegram: ignoring command from unknown chat", "chat", update.ChatID)
 		return
 	}
+	ctx = WithChat(ctx, update.ChatID)
 	// A reply to a question the bot asked belongs to that question — including
 	// one that starts with a slash, since a task brief may well open with a
 	// path or a command the agent is meant to run.

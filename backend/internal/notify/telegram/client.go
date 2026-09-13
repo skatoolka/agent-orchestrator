@@ -28,6 +28,11 @@ const (
 	// be set for the notifier to come up.
 	EnvBotToken = "AO_TELEGRAM_BOT_TOKEN"
 	EnvChatID   = "AO_TELEGRAM_CHAT_ID"
+	// EnvExtraChats lists further chats allowed to drive the bot, comma
+	// separated — typically an operator's direct message with it. The main chat
+	// stays the one notifications go to; these only get answers to what they
+	// themselves asked.
+	EnvExtraChats = "AO_TELEGRAM_EXTRA_CHATS"
 	// EnvAPIBase overrides the Telegram API root; tests point it at httptest.
 	EnvAPIBase = "AO_TELEGRAM_API_BASE"
 	// EnvProxy routes Telegram traffic through an HTTP proxy. Required wherever
@@ -47,13 +52,19 @@ type Client struct {
 	apiBase   string
 	token     string
 	chatID    string
+	// extraChats are allowed to command the bot besides chatID. Kept separate
+	// from it on purpose: chatID is where the conveyor speaks on its own
+	// (cards, idle sessions, escalations), and that stays one address.
+	extraChats []string
 }
 
 // Config configures a Client. Empty fields fall back to the environment.
 type Config struct {
-	Token   string
-	ChatID  string
-	APIBase string
+	Token  string
+	ChatID string
+	// ExtraChats is the raw comma-separated list from EnvExtraChats.
+	ExtraChats string
+	APIBase    string
 	// Proxy is an HTTP proxy URL for Telegram traffic only. Empty means direct.
 	Proxy      string
 	HTTPClient *http.Client
@@ -68,20 +79,22 @@ func NewFromEnv() (*Client, bool) {
 		return nil, false
 	}
 	return New(Config{
-		Token:   token,
-		ChatID:  chatID,
-		APIBase: os.Getenv(EnvAPIBase),
-		Proxy:   os.Getenv(EnvProxy),
+		Token:      token,
+		ChatID:     chatID,
+		ExtraChats: os.Getenv(EnvExtraChats),
+		APIBase:    os.Getenv(EnvAPIBase),
+		Proxy:      os.Getenv(EnvProxy),
 	}), true
 }
 
 // New builds a client from an explicit config.
 func New(cfg Config) *Client {
 	c := &Client{
-		http:    cfg.HTTPClient,
-		apiBase: strings.TrimRight(strings.TrimSpace(cfg.APIBase), "/"),
-		token:   strings.TrimSpace(cfg.Token),
-		chatID:  strings.TrimSpace(cfg.ChatID),
+		http:       cfg.HTTPClient,
+		apiBase:    strings.TrimRight(strings.TrimSpace(cfg.APIBase), "/"),
+		token:      strings.TrimSpace(cfg.Token),
+		chatID:     strings.TrimSpace(cfg.ChatID),
+		extraChats: splitChats(cfg.ExtraChats),
 	}
 	c.transport = proxyTransport(cfg.Proxy)
 	if c.http == nil {
@@ -93,9 +106,65 @@ func New(cfg Config) *Client {
 	return c
 }
 
-// ChatID reports the chat this client talks to. Updates from any other chat are
-// ignored, so a leaked bot username cannot drive the conveyor.
+// ChatID reports the chat the conveyor speaks to on its own — cards, idle
+// sessions, escalations all go here regardless of who asked for what.
 func (c *Client) ChatID() string { return c.chatID }
+
+// splitChats parses a comma-separated chat list, dropping blanks so a trailing
+// comma or an empty variable does not become a chat id of "".
+func splitChats(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if id := strings.TrimSpace(part); id != "" {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// AllowsChat reports whether this chat may command the bot. The bot's username
+// is discoverable, so the chat is the authorization boundary: everything else
+// is dropped without a reply.
+func (c *Client) AllowsChat(id string) bool {
+	if id == "" {
+		return false
+	}
+	if id == c.chatID {
+		return true
+	}
+	for _, extra := range c.extraChats {
+		if id == extra {
+			return true
+		}
+	}
+	return false
+}
+
+// chatKey types the context value below. A plain string key would collide with
+// anything else storing "chat" in a context.
+type chatKey struct{}
+
+// WithChat marks the chat a reply belongs to. The bot sets it once per update,
+// and every send below picks it up — without this an answer to a question asked
+// in a direct message would arrive in the main chat, where the person who asked
+// cannot see it, and the bot would look dead to them for the second time.
+func WithChat(ctx context.Context, chatID string) context.Context {
+	if strings.TrimSpace(chatID) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, chatKey{}, strings.TrimSpace(chatID))
+}
+
+// chatFor resolves where a message goes: the chat of the update being handled,
+// or the main chat when the send is the conveyor's own initiative. An unknown
+// chat in the context is ignored rather than trusted — replies are addressed by
+// the same rule that admits commands.
+func (c *Client) chatFor(ctx context.Context) string {
+	if id, ok := ctx.Value(chatKey{}).(string); ok && c.AllowsChat(id) {
+		return id
+	}
+	return c.chatID
+}
 
 // Send posts one message. Text is sent as-is (no parse mode), so issue titles
 // and agent output cannot break formatting or be interpreted as markup.
@@ -133,7 +202,7 @@ func (c *Client) Ask(ctx context.Context, text, mention string) (int64, error) {
 
 func (c *Client) send(ctx context.Context, text string, markup any) (int64, error) {
 	payload := map[string]any{
-		"chat_id":                  c.chatID,
+		"chat_id":                  c.chatFor(ctx),
 		"text":                     text,
 		"disable_web_page_preview": true,
 	}
@@ -225,7 +294,7 @@ func (c *Client) Edit(ctx context.Context, messageID int64, text string) error {
 // chat keeps one card for one task instead of a trail of dead menus.
 func (c *Client) EditWithKeyboard(ctx context.Context, messageID int64, text string, keyboard Keyboard) error {
 	payload := map[string]any{
-		"chat_id":                  c.chatID,
+		"chat_id":                  c.chatFor(ctx),
 		"message_id":               messageID,
 		"text":                     text,
 		"disable_web_page_preview": true,
