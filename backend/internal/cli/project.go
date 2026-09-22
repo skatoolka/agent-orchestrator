@@ -88,13 +88,32 @@ type roleOverride struct {
 
 // trackerIntakeConfig mirrors domain.TrackerIntakeConfig.
 type trackerIntakeConfig struct {
-	Enabled       bool   `json:"enabled,omitempty"`
-	Provider      string `json:"provider,omitempty"`
-	Repo          string `json:"repo,omitempty"`
-	Assignee      string `json:"assignee,omitempty"`
-	ProjectID     string `json:"projectId,omitempty"`
-	ReadyStatus   string `json:"readyStatus,omitempty"`
-	MaxConcurrent int    `json:"maxConcurrent,omitempty"`
+	Enabled       bool     `json:"enabled,omitempty"`
+	Provider      string   `json:"provider,omitempty"`
+	Repo          string   `json:"repo,omitempty"`
+	Assignee      string   `json:"assignee,omitempty"`
+	Labels        []string `json:"labels,omitempty"`
+	ProjectID     string   `json:"projectId,omitempty"`
+	ReadyStatus   string   `json:"readyStatus,omitempty"`
+	MaxConcurrent int      `json:"maxConcurrent,omitempty"`
+}
+
+// splitCSV turns a comma-separated flag into a slice, dropping blanks. The
+// mirror struct above is the reason this file exists at all: it is a COPY of
+// domain.TrackerIntakeConfig, and a field missing here is dropped from
+// --config-json before the daemon ever sees it — the daemon then rejects the
+// request for a field the caller did pass.
+func splitCSV(value string) []string {
+	out := make([]string, 0, 2)
+	for _, part := range strings.Split(value, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // projectConfig mirrors the daemon's typed domain.ProjectConfig for the CLI
@@ -137,6 +156,7 @@ type projectSetConfigOptions struct {
 	trackerIntake        bool
 	trackerRepo          string
 	trackerAssignee      string
+	trackerLabels        string
 	trackerProjectID     string
 	trackerReadyStatus   string
 	trackerMaxConcurrent int
@@ -331,6 +351,7 @@ func newProjectSetConfigCommand(ctx *commandContext) *cobra.Command {
 	f.BoolVar(&opts.trackerIntake, "tracker-intake", false, "Enable GitHub issue intake for matching issues")
 	f.StringVar(&opts.trackerRepo, "tracker-repo", "", "GitHub repo for issue intake (owner/repo; default: derive from git origin)")
 	f.StringVar(&opts.trackerAssignee, "tracker-assignee", "", "GitHub issue assignee required for intake eligibility")
+	f.StringVar(&opts.trackerLabels, "tracker-labels", "", "comma-separated issue labels required for intake eligibility")
 	f.StringVar(&opts.trackerProjectID, "tracker-project-id", "", "GitHub Projects v2 board node id (PVT_...); switches intake to the board")
 	f.StringVar(&opts.trackerReadyStatus, "tracker-ready-status", "", "Board column intake claims cards from (default: Ready)")
 	f.IntVar(&opts.trackerMaxConcurrent, "tracker-max-concurrent", 0, "Cap on live intake-started sessions for this project (0: unlimited)")
@@ -377,6 +398,7 @@ func buildProjectConfig(opts projectSetConfigOptions) (projectConfig, error) {
 			Provider:      trackerProviderForFlags(opts),
 			Repo:          opts.trackerRepo,
 			Assignee:      opts.trackerAssignee,
+			Labels:        splitCSV(opts.trackerLabels),
 			ProjectID:     opts.trackerProjectID,
 			ReadyStatus:   opts.trackerReadyStatus,
 			MaxConcurrent: opts.trackerMaxConcurrent,
@@ -395,7 +417,8 @@ func trackerProviderForFlags(opts projectSetConfigOptions) string {
 	if opts.trackerProjectID != "" || opts.trackerReadyStatus != "" {
 		return "github-projects"
 	}
-	if opts.trackerIntake || opts.trackerRepo != "" || opts.trackerAssignee != "" || opts.trackerMaxConcurrent > 0 {
+	if opts.trackerIntake || opts.trackerRepo != "" || opts.trackerAssignee != "" ||
+		opts.trackerLabels != "" || opts.trackerMaxConcurrent > 0 {
 		return "github"
 	}
 	return ""
