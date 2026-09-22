@@ -104,10 +104,12 @@ type TrackerIntakeConfig struct {
 	// such as "*" are passed through unchanged.
 	Assignee string `json:"assignee,omitempty"`
 	// Labels narrows eligible issues to those carrying ALL of these labels.
-	// github only. It is the other way to mark an issue ready, and the cheaper
-	// one for tooling: a label is set over plain REST and needs no account,
-	// while an assignee must be a repository user — a GitHub App's bot cannot
-	// be one, and GitHub drops an unknown login silently.
+	// github only. It is the other way to mark an issue ready, and the only one
+	// open to tooling without an account of its own: an assignee must be a user
+	// the repository accepts, and a GitHub App's bot is not one — measured
+	// 2026-09-22, GET /repos/<repo>/assignees/<app>[bot] answers 404 and the
+	// POST answers 403. An unknown login is worse still: it is dropped
+	// silently, with 201 and an empty assignees list.
 	Labels []string `json:"labels,omitempty"`
 	// ProjectID is the Projects v2 board node id ("PVT_..."). Required by the
 	// github-projects provider and ignored by github. A node id is used rather
