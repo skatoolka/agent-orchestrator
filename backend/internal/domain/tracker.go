@@ -103,6 +103,12 @@ type TrackerIntakeConfig struct {
 	// Assignee narrows eligible issues to one assignee. Provider-specific values
 	// such as "*" are passed through unchanged.
 	Assignee string `json:"assignee,omitempty"`
+	// Labels narrows eligible issues to those carrying ALL of these labels.
+	// github only. It is the other way to mark an issue ready, and the cheaper
+	// one for tooling: a label is set over plain REST and needs no account,
+	// while an assignee must be a repository user — a GitHub App's bot cannot
+	// be one, and GitHub drops an unknown login silently.
+	Labels []string `json:"labels,omitempty"`
 	// ProjectID is the Projects v2 board node id ("PVT_..."). Required by the
 	// github-projects provider and ignored by github. A node id is used rather
 	// than owner+number because it resolves identically for user- and
@@ -152,6 +158,9 @@ func (c TrackerIntakeConfig) Validate() error {
 	if c.MaxConcurrent < 0 {
 		return fmt.Errorf("trackerIntake.maxConcurrent: must not be negative, got %d", c.MaxConcurrent)
 	}
+	if len(c.Labels) > 0 && c.Provider == TrackerProviderGitHubProjects {
+		return fmt.Errorf("trackerIntake.labels: only supported by provider %q", TrackerProviderGitHub)
+	}
 	if c.Provider == TrackerProviderGitHubProjects {
 		// The board column is the eligibility rule here, so an assignee is not
 		// required — but the board itself must be named, otherwise there is
@@ -167,11 +176,16 @@ func (c TrackerIntakeConfig) Validate() error {
 	if strings.TrimSpace(c.ReadyStatus) != "" {
 		return fmt.Errorf("trackerIntake.readyStatus: only supported by provider %q", TrackerProviderGitHubProjects)
 	}
-	// Plain issue-list intake has no column to narrow on, so an explicit
-	// assignee rule is the only thing standing between intake and draining the
-	// whole backlog.
-	if strings.TrimSpace(c.Assignee) == "" {
-		return fmt.Errorf("trackerIntake: assignee is required when enabled")
+	for _, label := range c.Labels {
+		if err := validateNoWhitespaceField("trackerIntake.labels", label); err != nil {
+			return err
+		}
+	}
+	// Plain issue-list intake has no column to narrow on, so an explicit rule —
+	// an assignee or a label — is the only thing standing between intake and
+	// draining the whole backlog.
+	if strings.TrimSpace(c.Assignee) == "" && len(c.Labels) == 0 {
+		return fmt.Errorf("trackerIntake: assignee or labels are required when enabled")
 	}
 	return nil
 }

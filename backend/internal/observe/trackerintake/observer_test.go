@@ -377,6 +377,57 @@ func TestIssueMatchesConfigAssigneeSpecialValues(t *testing.T) {
 	}
 }
 
+func TestIssueMatchesConfigLabels(t *testing.T) {
+	// A label is the other way to mark an issue ready, and the only one open to
+	// tooling that has no repository account: an App's bot cannot be an
+	// assignee, and GitHub drops an unknown login silently.
+	ready := domain.Issue{Labels: []string{"type:bug", "Ready-For-Agent"}}
+	plain := domain.Issue{Labels: []string{"type:bug"}}
+	cfg := domain.TrackerIntakeConfig{Labels: []string{"ready-for-agent"}}
+
+	if !issueMatchesConfig(ready, cfg) {
+		t.Fatal("labelled issue should match; comparison is case-insensitive")
+	}
+	if issueMatchesConfig(plain, cfg) {
+		t.Fatal("issue without the label should not match")
+	}
+	// Every configured label must be present: two markers mean two conditions.
+	both := domain.TrackerIntakeConfig{Labels: []string{"ready-for-agent", "P1"}}
+	if issueMatchesConfig(ready, both) {
+		t.Fatal("issue missing one of the labels should not match")
+	}
+	// The label check runs on top of the assignee rule, not instead of it.
+	withAssignee := domain.TrackerIntakeConfig{Labels: []string{"ready-for-agent"}, Assignee: "alice"}
+	if issueMatchesConfig(ready, withAssignee) {
+		t.Fatal("labelled issue with no assignee should not match an assignee rule")
+	}
+}
+
+func TestTrackerIntakeConfigAcceptsLabelsWithoutAssignee(t *testing.T) {
+	cfg := domain.TrackerIntakeConfig{
+		Enabled:  true,
+		Provider: domain.TrackerProviderGitHub,
+		Repo:     "acme/demo",
+		Labels:   []string{"ready-for-agent"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil: a label narrows intake as well as an assignee", err)
+	}
+	bare := domain.TrackerIntakeConfig{Enabled: true, Provider: domain.TrackerProviderGitHub, Repo: "acme/demo"}
+	if err := bare.Validate(); err == nil {
+		t.Fatal("Validate() = nil, want error: intake without any narrowing rule drains the backlog")
+	}
+	board := domain.TrackerIntakeConfig{
+		Enabled:   true,
+		Provider:  domain.TrackerProviderGitHubProjects,
+		ProjectID: "PVT_x",
+		Labels:    []string{"ready-for-agent"},
+	}
+	if err := board.Validate(); err == nil {
+		t.Fatal("Validate() = nil, want error: the board provider has a column, labels are not its rule")
+	}
+}
+
 func TestBuildIssuePromptCapsLargeIssueBody(t *testing.T) {
 	prompt := BuildIssuePrompt(domain.Issue{
 		ID:    domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#99"},

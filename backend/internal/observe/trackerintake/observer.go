@@ -128,7 +128,7 @@ type Observer struct {
 	// about each one once instead of on every tick.
 	quarantined map[domain.IssueID]bool
 	gate        *Gate
-	announcer      Announcer
+	announcer   Announcer
 }
 
 // New constructs an Observer with safe defaults.
@@ -232,6 +232,7 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 	issues, err := tracker.List(ctx, repo, domain.ListFilter{
 		State:    domain.ListOpen,
 		Assignee: cfg.Assignee,
+		Labels:   cfg.Labels,
 	})
 	if err != nil {
 		o.logger.Error("tracker intake: list issues failed", "project", project.ID, "repo", repo.Native, "err", err)
@@ -338,6 +339,14 @@ func (o *Observer) parkedOnOpenPR(ctx context.Context, id domain.SessionID) bool
 }
 
 func issueMatchesConfig(issue domain.Issue, cfg domain.TrackerIntakeConfig) bool {
+	// Labels are re-checked locally for the same reason the assignee is: the
+	// provider filter is a query hint, and a stale list must not start work on
+	// an issue whose marker has already been removed.
+	for _, label := range cfg.Labels {
+		if !containsFold(issue.Labels, strings.TrimSpace(label)) {
+			return false
+		}
+	}
 	assignee := strings.TrimSpace(cfg.Assignee)
 	switch {
 	case assignee == "":
