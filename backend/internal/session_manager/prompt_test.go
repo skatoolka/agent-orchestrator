@@ -1,6 +1,8 @@
 package sessionmanager
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -166,5 +168,55 @@ func TestBuildProjectRules_ReadsInlineAndFileRules(t *testing.T) {
 func TestProjectRelativeFileRejectsTraversal(t *testing.T) {
 	if _, err := projectRelativeFile(t.TempDir(), "../rules.md"); err == nil {
 		t.Fatal("expected traversal path to be rejected")
+	}
+}
+
+func TestBuildProjectRulesPrefersTheDefaultBranchOverAStaleCheckout(t *testing.T) {
+	// The base clone's working tree is never updated by anything: AO creates
+	// session worktrees from a fresh fetch, so agents work on current code
+	// while this tree can sit months behind. Measured 2026-09-23: 1461 commits
+	// behind, and the rules file the operator had just committed did not exist
+	// in it at all.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "rules.md"), []byte("STALE"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restore := gitShow
+	gitShow = func(gotDir, ref, rel string) ([]byte, error) {
+		if gotDir != dir || ref != "origin/main" || rel != "rules.md" {
+			return nil, fmt.Errorf("unexpected git show %s %s:%s", gotDir, ref, rel)
+		}
+		return []byte("FRESH"), nil
+	}
+	t.Cleanup(func() { gitShow = restore })
+
+	rules, err := buildProjectRules(projectRulesConfig{ProjectPath: dir, AgentRulesFile: "rules.md", DefaultBranch: "main"})
+	if err != nil {
+		t.Fatalf("buildProjectRules() error = %v", err)
+	}
+	if rules != "FRESH" {
+		t.Fatalf("rules = %q, want the committed version, not the checkout", rules)
+	}
+}
+
+func TestBuildProjectRulesFallsBackToTheCheckout(t *testing.T) {
+	// No default branch, or a repository git cannot answer for: the previous
+	// behaviour must remain, not an error.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "rules.md"), []byte("FROM DISK"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restore := gitShow
+	gitShow = func(string, string, string) ([]byte, error) { return nil, errors.New("not a git repository") }
+	t.Cleanup(func() { gitShow = restore })
+
+	for _, branch := range []string{"", "main"} {
+		rules, err := buildProjectRules(projectRulesConfig{ProjectPath: dir, AgentRulesFile: "rules.md", DefaultBranch: branch})
+		if err != nil {
+			t.Fatalf("buildProjectRules(branch=%q) error = %v", branch, err)
+		}
+		if rules != "FROM DISK" {
+			t.Fatalf("rules = %q, want the checkout copy", rules)
+		}
 	}
 }
