@@ -613,6 +613,86 @@ func TestIntakeCountsExistingLiveSessionsAgainstTheCap(t *testing.T) {
 	}
 }
 
+func TestIntakeReleasesTheSlotOfASilentSession(t *testing.T) {
+	// The cap bounds what agents SPEND. A session that has gone quiet spends
+	// nothing, yet nothing terminates it either: measured 2026-09-22, a
+	// conveyor restart left two agents sitting at an empty prompt and two
+	// claimed cards waited behind them indefinitely.
+	now := time.Date(2026, 9, 23, 6, 0, 0, 0, time.UTC)
+	tracker := &fakeTracker{issues: []domain.Issue{
+		{ID: domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#7"}, State: domain.IssueOpen, Assignees: []string{"octocat"}},
+	}}
+	store := &fakeStore{
+		projects: []domain.ProjectRecord{{
+			ID:            "proj",
+			RepoOriginURL: "https://github.com/acme/demo.git",
+			Config: domain.ProjectConfig{TrackerIntake: domain.TrackerIntakeConfig{
+				Enabled:       true,
+				Provider:      domain.TrackerProviderGitHub,
+				Assignee:      "*",
+				MaxConcurrent: 1,
+			}},
+		}},
+		sessions: []domain.SessionRecord{{
+			ID:        "proj-1",
+			ProjectID: "proj",
+			IssueID:   "github:acme/demo#5",
+			Activity:  domain.Activity{LastActivityAt: now.Add(-3 * time.Hour)},
+		}},
+	}
+	spawner := &fakeSpawner{}
+
+	obs := New(singleResolver(tracker), store, spawner, Config{Logger: discardLogger(), Clock: func() time.Time { return now }})
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(spawner.calls) != 1 {
+		t.Fatalf("spawned %d sessions, want 1: a session silent for three hours must not hold the slot", len(spawner.calls))
+	}
+}
+
+func TestIntakeKeepsTheSlotOfARecentlyActiveSession(t *testing.T) {
+	now := time.Date(2026, 9, 23, 6, 0, 0, 0, time.UTC)
+	tracker := &fakeTracker{issues: []domain.Issue{
+		{ID: domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#7"}, State: domain.IssueOpen, Assignees: []string{"octocat"}},
+	}}
+	base := domain.ProjectRecord{
+		ID:            "proj",
+		RepoOriginURL: "https://github.com/acme/demo.git",
+		Config: domain.ProjectConfig{TrackerIntake: domain.TrackerIntakeConfig{
+			Enabled:       true,
+			Provider:      domain.TrackerProviderGitHub,
+			Assignee:      "*",
+			MaxConcurrent: 1,
+		}},
+	}
+
+	// Working a minute ago: obviously busy.
+	busy := &fakeStore{projects: []domain.ProjectRecord{base}, sessions: []domain.SessionRecord{{
+		ID: "proj-1", ProjectID: "proj", IssueID: "github:acme/demo#5",
+		Activity: domain.Activity{LastActivityAt: now.Add(-time.Minute)},
+	}}}
+	spawner := &fakeSpawner{}
+	if err := New(singleResolver(tracker), busy, spawner, Config{Logger: discardLogger(), Clock: func() time.Time { return now }}).Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(spawner.calls) != 0 {
+		t.Fatalf("spawned %d sessions, want none: the slot is held by a working session", len(spawner.calls))
+	}
+
+	// Never reported yet: a session that just spawned is about to work, not idle.
+	fresh := &fakeStore{projects: []domain.ProjectRecord{base}, sessions: []domain.SessionRecord{{
+		ID: "proj-2", ProjectID: "proj", IssueID: "github:acme/demo#5",
+	}}}
+	spawner = &fakeSpawner{}
+	if err := New(singleResolver(tracker), fresh, spawner, Config{Logger: discardLogger(), Clock: func() time.Time { return now }}).Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(spawner.calls) != 0 {
+		t.Fatalf("spawned %d sessions, want none: a freshly spawned session has no activity stamp yet", len(spawner.calls))
+	}
+}
+
 func TestTrackerRepoScopesBoardProviderToTheProjectRepo(t *testing.T) {
 	project := domain.ProjectRecord{ID: "proj", RepoOriginURL: "https://github.com/acme/demo.git"}
 	cfg := domain.TrackerIntakeConfig{
