@@ -405,6 +405,7 @@ func Run() error {
 		Telemetry:          telemetrySink,
 		Mobile:             mc,
 		Announce:           chatAnnounceAPI{notifier: chatNotifier},
+		Propose:            chatProposeAPI{notifier: chatNotifier},
 		DevImport: devimportsvc.New(devimportsvc.Deps{
 			Store:         store,
 			TargetDataDir: cfg.DataDir,

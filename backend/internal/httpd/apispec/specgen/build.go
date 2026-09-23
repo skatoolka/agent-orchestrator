@@ -1605,6 +1605,19 @@ func sessionOperations() []operation {
 			},
 		},
 		{
+			method: http.MethodPost, path: "/api/v1/propose", id: "proposeSession", tag: "chat",
+			summary: "Ask a human to authorize starting a session",
+			reqBody: controllers.ProposeRequest{},
+			resps: []respUnit{
+				// OK means the card reached the chat, not that it was approved:
+				// the answer is a button press, minutes or hours later.
+				{http.StatusOK, controllers.ProposeResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusServiceUnavailable, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+		{
 			method: http.MethodPost, path: "/api/v1/sessions/{sessionId}/send", id: "sendSessionMessage", tag: "sessions",
 			summary:    "Send a message to a running session's agent",
 			pathParams: []any{controllers.SessionIDParam{}},

@@ -228,6 +228,192 @@ func TestTaskButtonAsksForTheTextAndSpawnsOnTheReply(t *testing.T) {
 	}
 }
 
+// Как это ломалось вживую (22.09.2026, личка с ботом): человек нажал «Задача
+// текстом», бот открыл поле ответа, а человек — как и положено в личке —
+// просто напечатал следующее сообщение. Оно не было reply, поэтому уходило в
+// ветку «неопознанный текст» → агенту-дежурному, который сессии спавнить не
+// вправе и отвечал на это объяснением. Со стороны бот выглядел так, будто
+// проигнорировал собственный вопрос.
+func TestTaskAnswerCountsWithoutTheReplyBox(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{privateBatch(1, "42", "/new")}}
+	spawner := &fakeSpawner{projects: []Project{{ID: "vibeli"}}}
+	duty := &fakeDuty{}
+	runBotWithDeps(t, Deps{Client: newTestClient(t, api), Spawner: spawner, Duty: duty, Links: testLinks()})
+
+	menu := waitForPosts(t, api, 1)[0]
+	press := findButton(t, menu.markup, "Задача текстом")
+	api.mu.Lock()
+	api.updates = append(api.updates, callbackBatch(2, "42", press, 1))
+	api.mu.Unlock()
+	waitForPosts(t, api, 2)
+
+	// Обычное сообщение, без reply_to_message_id — ровно то, что печатает
+	// человек в личке.
+	api.mu.Lock()
+	api.updates = append(api.updates, privateBatch(3, "42", "Подхвати PR#747"))
+	api.mu.Unlock()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(spawner.calls()) == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	calls := spawner.calls()
+	if len(calls) != 1 || calls[0].prompt != "Подхвати PR#747" {
+		t.Fatalf("spawned = %v, want the plain message as the task", calls)
+	}
+	if asked := duty.list(); len(asked) != 0 {
+		t.Fatalf("задача не должна уходить дежурному: %v", asked)
+	}
+}
+
+// Ожидание одноразовое: второе сообщение — уже обычный вопрос дежурному, иначе
+// бот молча съедал бы всю переписку, считая её продолжением задачи.
+func TestOnlyTheFirstMessageAfterTheQuestionIsTheTask(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{privateBatch(1, "42", "/new")}}
+	spawner := &fakeSpawner{projects: []Project{{ID: "vibeli"}}}
+	duty := &fakeDuty{}
+	runBotWithDeps(t, Deps{Client: newTestClient(t, api), Spawner: spawner, Duty: duty, Links: testLinks()})
+
+	menu := waitForPosts(t, api, 1)[0]
+	api.mu.Lock()
+	api.updates = append(api.updates, callbackBatch(2, "42", findButton(t, menu.markup, "Задача текстом"), 1))
+	api.mu.Unlock()
+	waitForPosts(t, api, 2)
+
+	api.mu.Lock()
+	api.updates = append(api.updates, privateBatch(3, "42", "первая задача"))
+	api.updates = append(api.updates, privateBatch(4, "42", "а что там с деплоем?"))
+	api.mu.Unlock()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(duty.list()) == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if calls := spawner.calls(); len(calls) != 1 || calls[0].prompt != "первая задача" {
+		t.Fatalf("spawned = %v, want exactly the first message", calls)
+	}
+	if asked := duty.list(); len(asked) != 1 || !strings.Contains(asked[0], "деплоем") {
+		t.Fatalf("второе сообщение — обычный вопрос дежурному, got %v", asked)
+	}
+}
+
+// В группе чужая реплика не становится задачей оттого, что бот кого-то ждёт:
+// claim стоит ПОСЛЕ проверки «обращаются ли к боту».
+func TestGroupChatterIsNotTakenAsTheTask(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "/new")}}
+	spawner := &fakeSpawner{projects: []Project{{ID: "vibeli"}}}
+	duty := &fakeDuty{}
+	runBotWithDeps(t, Deps{Client: newTestClient(t, api), Spawner: spawner, Duty: duty, Links: testLinks()})
+
+	menu := waitForPosts(t, api, 1)[0]
+	api.mu.Lock()
+	api.updates = append(api.updates, callbackBatch(2, "42", findButton(t, menu.markup, "Задача текстом"), 1))
+	api.mu.Unlock()
+	waitForPosts(t, api, 2)
+
+	// Разговор двух людей в группе: бота не тегали, на его сообщение не отвечали.
+	api.mu.Lock()
+	api.updates = append(api.updates, updateBatch(3, "42", "обедать идём?"))
+	api.mu.Unlock()
+
+	time.Sleep(300 * time.Millisecond)
+	if calls := spawner.calls(); len(calls) != 0 {
+		t.Fatalf("чужая реплика не задача: %v", calls)
+	}
+	if asked := duty.list(); len(asked) != 0 {
+		t.Fatalf("и не вопрос дежурному: %v", asked)
+	}
+}
+
+// Предложение дежурного: карточка в чате, и НИЧЕГО не запущено, пока человек
+// не нажал. Ради этого свойства команда и заводилась — дежурному нужны руки,
+// решение остаётся у человека.
+func TestProposalStartsNothingUntilApproved(t *testing.T) {
+	api := &fakeAPI{}
+	spawner := &fakeSpawner{projects: []Project{{ID: "vibeli"}}}
+	bot := NewBot(Deps{Client: newTestClient(t, api), Spawner: spawner, Links: testLinks(), Logger: discardLogger()})
+
+	if err := bot.Propose(context.Background(), Proposal{
+		Project: "vibeli",
+		Prompt:  "Подхвати PR #747",
+		Session: "vibeli-24",
+		Reason:  "работа доведена, нужен исполнитель",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	posts := api.posts()
+	if len(posts) != 1 {
+		t.Fatalf("ожидалась одна карточка, got %#v", posts)
+	}
+	if !strings.Contains(posts[0].text, "vibeli-24") || !strings.Contains(posts[0].text, "PR #747") {
+		t.Fatalf("карточка обязана называть, кто просит и о чём:\n%s", posts[0].text)
+	}
+	if !strings.Contains(posts[0].text, "работа доведена") {
+		t.Fatalf("без причины предложение отвечается только угадыванием:\n%s", posts[0].text)
+	}
+	if calls := spawner.calls(); len(calls) != 0 {
+		t.Fatalf("до подтверждения ничего не запускается, got %v", calls)
+	}
+}
+
+func TestApprovedProposalSpawnsTheProposedTask(t *testing.T) {
+	api := &fakeAPI{}
+	spawner := &fakeSpawner{projects: []Project{{ID: "vibeli"}}}
+	runBotWithDeps(t, Deps{Client: newTestClient(t, api), Spawner: spawner, Links: testLinks()})
+	// Бот уже крутится: карточку кладём через тот же публичный путь, каким её
+	// кладёт ручка /api/v1/propose.
+	bot := NewBot(Deps{Client: newTestClient(t, api), Spawner: spawner, Links: testLinks(), Logger: discardLogger()})
+	if err := bot.Propose(context.Background(), Proposal{Project: "vibeli", Prompt: "Подхвати PR #747"}); err != nil {
+		t.Fatal(err)
+	}
+	card := api.posts()[0]
+	approve := findButton(t, card.markup, "Запустить")
+
+	// Нажатие разрешает: дальше тот же путь, что и у меню.
+	if _, ok := bot.desk.lookup(approve); !ok {
+		t.Fatal("кнопка подтверждения обязана быть зарегистрирована")
+	}
+	bot.press(context.Background(), Update{ChatID: "42", CallbackID: "cb", CallbackData: approve, MessageID: 1})
+
+	calls := spawner.calls()
+	if len(calls) != 1 || calls[0].prompt != "Подхвати PR #747" || calls[0].project != "vibeli" {
+		t.Fatalf("подтверждение обязано запустить ровно предложенное, got %v", calls)
+	}
+}
+
+func TestDeclinedProposalStartsNothing(t *testing.T) {
+	api := &fakeAPI{}
+	spawner := &fakeSpawner{projects: []Project{{ID: "vibeli"}}}
+	bot := NewBot(Deps{Client: newTestClient(t, api), Spawner: spawner, Links: testLinks(), Logger: discardLogger()})
+	if err := bot.Propose(context.Background(), Proposal{Project: "vibeli", Prompt: "снести прод"}); err != nil {
+		t.Fatal(err)
+	}
+	decline := findButton(t, api.posts()[0].markup, "Отклонить")
+	bot.press(context.Background(), Update{ChatID: "42", CallbackID: "cb", CallbackData: decline, MessageID: 1})
+
+	if calls := spawner.calls(); len(calls) != 0 {
+		t.Fatalf("отклонённое предложение ничего не запускает, got %v", calls)
+	}
+	edits := api.rewrites()
+	if len(edits) == 0 || !strings.Contains(edits[len(edits)-1].text, "отклонено") {
+		t.Fatalf("отказ обязан быть виден в чате, got %#v", edits)
+	}
+}
+
+// Предложение без задачи — ошибка вызывающего, а не пустая карточка в чате.
+func TestProposalNeedsProjectAndPrompt(t *testing.T) {
+	api := &fakeAPI{}
+	bot := NewBot(Deps{Client: newTestClient(t, api), Spawner: &fakeSpawner{}, Links: testLinks(), Logger: discardLogger()})
+	for _, p := range []Proposal{{Project: "vibeli"}, {Prompt: "что-то"}, {}} {
+		if err := bot.Propose(context.Background(), p); err == nil {
+			t.Fatalf("пустое предложение обязано отбиваться: %#v", p)
+		}
+	}
+	if posts := api.posts(); len(posts) != 0 {
+		t.Fatalf("в чат при этом ничего не уходит: %#v", posts)
+	}
+}
+
 func TestQueueButtonClaimsTheCard(t *testing.T) {
 	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "/new")}}
 	spawner := &fakeSpawner{projects: []Project{{ID: "vibeli"}}}
