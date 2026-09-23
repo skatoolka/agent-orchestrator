@@ -27,8 +27,12 @@ import (
 // nil, so call sites stay branch-free: the publisher is nil, Announce is a
 // no-op, and the gate still works for other pause sources.
 type chatNotifier struct {
-	client   *telegram.Client
-	pub      *telegram.Publisher
+	client *telegram.Client
+	pub    *telegram.Publisher
+	// bot is kept so the proposal route can reach the button registry: a card
+	// with live buttons can only be built by the bot that will later resolve
+	// them. Nil until startBot runs, and on a deployment without a chat.
+	bot      *telegram.Bot
 	gate     *trackerintake.Gate
 	conveyor telegram.Conveyor
 	answers  *answerSlots
@@ -139,6 +143,7 @@ func (c *chatNotifier) startBot(ctx context.Context, store *sqlite.Store, sessio
 		Links:    chatLinks(),
 		Logger:   c.logger,
 	})
+	c.bot = bot
 	return bot.Start(ctx)
 }
 
@@ -258,6 +263,25 @@ func (a chatAnnounceAPI) Announce(_ context.Context, text, session string) error
 	}
 	a.notifier.pub.Announce(text)
 	return nil
+}
+
+// chatProposeAPI is the duty agent's hands: POST /api/v1/propose, reached by
+// `ao propose`. It posts a card and stops there — the session starts only when
+// a human presses the button, so the decision stays where it was.
+type chatProposeAPI struct {
+	notifier *chatNotifier
+}
+
+func (a chatProposeAPI) Propose(ctx context.Context, project, prompt, session, reason string) error {
+	if a.notifier == nil || a.notifier.bot == nil {
+		return controllers.ErrChatUnavailable
+	}
+	return a.notifier.bot.Propose(ctx, telegram.Proposal{
+		Project: project,
+		Prompt:  prompt,
+		Session: session,
+		Reason:  reason,
+	})
 }
 
 // dutyDesk is the bot's view of the agent on duty: where a question goes, and

@@ -1181,6 +1181,43 @@ paths:
       summary: Initialize a selected folder as a Git repository with an initial commit
       tags:
       - projects
+  /api/v1/propose:
+    post:
+      operationId: proposeSession
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ControllersProposeRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControllersProposeResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Service Unavailable
+      summary: Ask a human to authorize starting a session
+      tags:
+      - chat
   /api/v1/prs/{id}/merge:
     post:
       operationId: mergePR
@@ -4849,6 +4886,30 @@ components:
       required:
       - ok
       - text
+      type: object
+    ControllersProposeRequest:
+      properties:
+        project:
+          type: string
+        prompt:
+          type: string
+        reason:
+          type: string
+        session:
+          type: string
+      required:
+      - project
+      - prompt
+      type: object
+    ControllersProposeResponse:
+      properties:
+        ok:
+          type: boolean
+        project:
+          type: string
+      required:
+      - ok
+      - project
       type: object
     ControllersSessionView:
       properties:

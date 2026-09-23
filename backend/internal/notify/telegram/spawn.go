@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -104,6 +105,14 @@ const (
 	// session card rather than the menu, since that is where a human is when
 	// they notice the link is gone.
 	actionReconnect = "reconnect"
+	// actionApprove and actionDecline answer a proposal from the agent on duty.
+	// Duty may not spawn sessions itself — it coordinates, and a coordinator
+	// that quietly starts work is no longer one — but refusing it any path at
+	// all left the person doing the typing: duty would explain what to run and
+	// wait for a human to run it. A proposal keeps the decision with the human
+	// and the typing with the machine.
+	actionApprove = "approve"
+	actionDecline = "decline"
 )
 
 // action is what one button does when pressed.
@@ -144,11 +153,19 @@ type desk struct {
 	seq     int64
 	actions map[string]action
 	prompts map[int64]action
+	// waiting is the same question keyed by CHAT, not by the message it was
+	// asked in. Telegram pre-opens a reply box, but nothing makes a person use
+	// it — in a direct message especially, where the whole chat is one
+	// conversation and the obvious move is to just type the next message.
+	// Without this the brief went to the agent on duty (the catch-all for
+	// unrecognized text), who cannot spawn sessions and says so — and the
+	// person sees the bot ignore the task it had just asked for.
+	waiting map[string]action
 	now     func() time.Time
 }
 
 func newDesk() *desk {
-	return &desk{actions: map[string]action{}, prompts: map[int64]action{}, now: time.Now}
+	return &desk{actions: map[string]action{}, prompts: map[int64]action{}, waiting: map[string]action{}, now: time.Now}
 }
 
 // register stores what a button does and returns its callback payload.
@@ -188,6 +205,38 @@ func (d *desk) await(messageID int64, a action) {
 	d.prompts[messageID] = a
 }
 
+// awaitChat records that this chat owes the bot a task brief, so the next plain
+// message counts even when it is not a reply. One outstanding question per
+// chat: a second /new replaces the first rather than queueing behind it.
+func (d *desk) awaitChat(chat string, a action) {
+	if strings.TrimSpace(chat) == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	a.born = d.now()
+	d.sweepLocked()
+	d.waiting[chat] = a
+}
+
+// claimChat takes the question this chat owes an answer to, removing it.
+func (d *desk) claimChat(chat string) (action, bool) {
+	if strings.TrimSpace(chat) == "" {
+		return action{}, false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	a, ok := d.waiting[chat]
+	if !ok {
+		return action{}, false
+	}
+	delete(d.waiting, chat)
+	if d.now().Sub(a.born) > promptTTL {
+		return action{}, false
+	}
+	return a, true
+}
+
 // claimReply takes the pending question a reply answers, removing it: one
 // question is answered once.
 func (d *desk) claimReply(messageID int64) (action, bool) {
@@ -222,11 +271,19 @@ func (d *desk) sweepLocked() {
 			delete(d.prompts, id)
 		}
 	}
+	for chat, a := range d.waiting {
+		if now.Sub(a.born) > promptTTL {
+			delete(d.waiting, chat)
+		}
+	}
 	if len(d.actions) > maxActions {
 		d.actions = map[string]action{}
 	}
 	if len(d.prompts) > maxActions {
 		d.prompts = map[int64]action{}
+	}
+	if len(d.waiting) > maxActions {
+		d.waiting = map[string]action{}
 	}
 }
 
@@ -324,8 +381,9 @@ func (b *Bot) cancelRow() []InlineButton {
 // askForTask opens a reply box for the task text. The question is a separate
 // message rather than an edit of the menu: Telegram only pre-opens the reply
 // box for a message it has just delivered.
-func (b *Bot) askForTask(ctx context.Context, project, mention string, back bool) (string, Keyboard) {
-	text := "✍️ Ответь на это сообщение текстом задачи для " + project + "."
+func (b *Bot) askForTask(ctx context.Context, chat, project, mention string, back bool) (string, Keyboard) {
+	text := "✍️ Ответь на это сообщение текстом задачи для " + project +
+		" — или просто пришли задачу следующим сообщением."
 	if mention != "" {
 		text = "@" + mention + ", " + text
 	}
@@ -334,8 +392,14 @@ func (b *Bot) askForTask(ctx context.Context, project, mention string, back bool
 		b.logger.Warn("telegram: prompt request failed", "err", err)
 		return "не смог спросить задачу: " + err.Error(), b.backKeyboard(project, back)
 	}
-	b.desk.await(messageID, action{kind: actionAsk, project: project})
-	return "🤖 Новая сессия · " + project + "\n\nЖду текст задачи ответом на сообщение ниже.", nil
+	// Оба ожидания сразу: по сообщению — для того, кто воспользовался полем
+	// ответа, по чату — для того, кто просто напечатал следующее сообщение.
+	// Второе и есть обычное поведение в личке, а раньше такой текст уходил
+	// дежурному, который сессии не спавнит.
+	pending := action{kind: actionAsk, project: project}
+	b.desk.await(messageID, pending)
+	b.desk.awaitChat(chat, pending)
+	return "🤖 Новая сессия · " + project + "\n\nЖду текст задачи: ответом на сообщение ниже или просто следующим сообщением.", nil
 }
 
 // spawnFromPrompt starts the session and hands back the two ways into it.
@@ -419,6 +483,46 @@ func issueLabel(item QueueItem) string {
 	return number + " " + title
 }
 
+// Proposal is an action the agent on duty asks a human to authorize.
+type Proposal struct {
+	// Project the session would start in.
+	Project string
+	// Prompt is the task brief the session would be given.
+	Prompt string
+	// Session names the duty session that proposed it, for the label.
+	Session string
+	// Reason is why duty thinks this should happen — one line, shown above the
+	// buttons. A proposal without it is answerable only by guessing.
+	Reason string
+}
+
+// Propose posts a proposal as a card with confirm/decline buttons. It returns
+// once the card is in the chat: nothing is started until a human presses, and
+// that is the whole point — duty gets hands, the human keeps the decision.
+func (b *Bot) Propose(ctx context.Context, p Proposal) error {
+	project := strings.TrimSpace(p.Project)
+	prompt := strings.TrimSpace(p.Prompt)
+	if project == "" || prompt == "" {
+		return errors.New("telegram: proposal needs a project and a task")
+	}
+	head := "🙋 Дежурный предлагает запустить сессию"
+	if session := strings.TrimSpace(p.Session); session != "" {
+		head = "🙋 " + session + " предлагает запустить сессию"
+	}
+	text := head + " · " + project + "\n\n" + truncate(prompt, 600)
+	if reason := strings.TrimSpace(p.Reason); reason != "" {
+		text += "\n\nЗачем: " + truncate(reason, 300)
+	}
+	keyboard := Keyboard{{
+		{Text: "✅ Запустить", Data: b.desk.register(action{kind: actionApprove, project: project, prompt: prompt})},
+		{Text: "✖️ Отклонить", Data: b.desk.register(action{kind: actionDecline, project: project})},
+	}}
+	if _, err := b.client.SendWithKeyboard(ctx, text, keyboard); err != nil {
+		return err
+	}
+	return nil
+}
+
 // press routes a button. Every branch ends in a rewrite of the menu message, so
 // the chat holds one card per task rather than a trail of dead menus.
 func (b *Bot) press(ctx context.Context, update Update) {
@@ -455,7 +559,7 @@ func (b *Bot) press(ctx context.Context, update Update) {
 		text, keyboard := b.projectMenu(act.project, act.back)
 		b.rewrite(ctx, update.MessageID, text, keyboard)
 	case actionAsk:
-		text, keyboard := b.askForTask(ctx, act.project, update.FromUsername, act.back)
+		text, keyboard := b.askForTask(ctx, update.ChatID, act.project, update.FromUsername, act.back)
 		b.rewrite(ctx, update.MessageID, text, keyboard)
 	case actionQueue:
 		text, keyboard := b.queueMenu(ctx, act.project, act.back)
@@ -473,6 +577,17 @@ func (b *Bot) press(ctx context.Context, update Update) {
 		if _, err := b.client.SendMessage(ctx, b.reconnect(ctx, act.ref)); err != nil {
 			b.logger.Warn("telegram: reply failed", "command", "/rc", "err", err)
 		}
+	case actionApprove:
+		// The same path a menu spawn takes: approval changes who decided, not
+		// what happens, so there is one way sessions start and one place it
+		// can break.
+		b.rewrite(ctx, update.MessageID, "⏳ запускаю сессию в "+act.project+"…", nil)
+		text, keyboard := b.spawnFromPrompt(ctx, act.project, act.prompt)
+		b.rewrite(ctx, update.MessageID, text, keyboard)
+	case actionDecline:
+		// The text stays in the chat above this line, so a declined proposal
+		// remains readable — and re-runnable by hand — instead of vanishing.
+		b.rewrite(ctx, update.MessageID, "✖️ отклонено", nil)
 	case actionCancel:
 		b.rewrite(ctx, update.MessageID, "отменено", nil)
 	}

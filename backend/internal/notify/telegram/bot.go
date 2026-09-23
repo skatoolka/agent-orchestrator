@@ -206,6 +206,19 @@ func (b *Bot) handle(ctx context.Context, update Update) {
 		if !b.addressed(update) {
 			return
 		}
+		// The bot asked this chat for a task brief and the person answered
+		// without using the reply box — which is what people do in a direct
+		// message, where the chat is the conversation. Before this the brief
+		// fell through to the agent on duty: the catch-all for text nobody
+		// recognized. Duty cannot spawn sessions, so the task died in a polite
+		// explanation, and the bot looked like it had ignored its own question.
+		//
+		// The claim happens AFTER addressed(): in a group, a reply between two
+		// humans is not an answer to the bot just because the bot is waiting.
+		if pending, ok := b.desk.claimChat(update.ChatID); ok {
+			b.spawnAnswer(ctx, pending.project, update.Text)
+			return
+		}
 		reply, session := b.ask(ctx, b.question(update))
 		messageID, err := b.client.SendMessage(ctx, reply)
 		if err != nil {

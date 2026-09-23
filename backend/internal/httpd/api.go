@@ -55,6 +55,8 @@ type APIDeps struct {
 	// Announce is the chat write surface. Nil keeps the route mounted and
 	// answering 501, like the other optional surfaces.
 	Announce controllers.ChatAnnouncer
+	// Propose posts an action for a human to authorize; nil disables the route.
+	Propose controllers.ChatProposer
 }
 
 // API owns one controller per resource and is the single Register call the
@@ -76,6 +78,7 @@ type API struct {
 	dev           *controllers.DevController
 	browser       *controllers.BrowserController
 	announce      *controllers.AnnounceController
+	propose       *controllers.ProposeController
 	events        *EventsController
 }
 
@@ -110,6 +113,7 @@ func NewAPI(cfg config.Config, deps APIDeps) *API {
 		dev:           &controllers.DevController{Import: deps.DevImport},
 		browser:       &controllers.BrowserController{Svc: deps.Browser},
 		announce:      &controllers.AnnounceController{Chat: deps.Announce},
+		propose:       &controllers.ProposeController{Chat: deps.Propose},
 		events:        &EventsController{Source: deps.CDC, Live: deps.Events},
 	}
 }
@@ -147,6 +151,7 @@ func (a *API) Register(root chi.Router) {
 			a.dev.Register(r)
 			a.browser.Register(r)
 			a.announce.Register(r)
+			a.propose.Register(r)
 			// Sibling REST controllers plug in here.
 		})
 		// Agent switching synchronously collects a handoff, starts the target,
