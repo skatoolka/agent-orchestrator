@@ -103,11 +103,28 @@ type Announcer interface {
 }
 
 // Config holds optional observer knobs. Zero values use production defaults.
+// DefaultIdleRelease is how long a session may show NO activity before it
+// stops holding a concurrency slot.
+//
+// The cap exists to bound what agents spend — tokens and parallel work. A
+// session that has shown nothing for an hour spends nothing, but under the
+// old rule it held the queue forever. Measured 2026-09-22: a conveyor restart
+// restored the panes, the agents came back sitting at an empty prompt (status
+// `no_signal` — AO cannot tell working from stuck), and two claimed cards
+// waited indefinitely behind two sessions that were doing nothing at all.
+//
+// An hour is far longer than any healthy gap between hook callbacks and far
+// shorter than the days a forgotten session can linger.
+const DefaultIdleRelease = time.Hour
+
 type Config struct {
 	Tick           time.Duration
 	FailureBackoff time.Duration
-	Clock          func() time.Time
-	Logger         *slog.Logger
+	// IdleRelease overrides DefaultIdleRelease. Negative disables the release
+	// entirely — every unterminated session holds its slot, as before.
+	IdleRelease time.Duration
+	Clock       func() time.Time
+	Logger      *slog.Logger
 	// Gate, when set, suspends claiming while paused.
 	Gate *Gate
 	// Announcer, when set, is told about each claimed card.
@@ -123,6 +140,7 @@ type Observer struct {
 	failureBackoff time.Duration
 	clock          func() time.Time
 	logger         *slog.Logger
+	idleRelease    time.Duration
 	backoffUntil   map[string]time.Time
 	// quarantined remembers issues intake stopped claiming, so the chat hears
 	// about each one once instead of on every tick.
@@ -133,12 +151,15 @@ type Observer struct {
 
 // New constructs an Observer with safe defaults.
 func New(resolver TrackerResolver, store Store, spawner Spawner, cfg Config) *Observer {
-	o := &Observer{resolver: resolver, store: store, spawner: spawner, tick: cfg.Tick, failureBackoff: cfg.FailureBackoff, clock: cfg.Clock, logger: cfg.Logger, backoffUntil: map[string]time.Time{}, quarantined: map[domain.IssueID]bool{}, gate: cfg.Gate, announcer: cfg.Announcer}
+	o := &Observer{resolver: resolver, store: store, spawner: spawner, tick: cfg.Tick, failureBackoff: cfg.FailureBackoff, clock: cfg.Clock, logger: cfg.Logger, idleRelease: cfg.IdleRelease, backoffUntil: map[string]time.Time{}, quarantined: map[domain.IssueID]bool{}, gate: cfg.Gate, announcer: cfg.Announcer}
 	if o.tick <= 0 {
 		o.tick = DefaultTickInterval
 	}
 	if o.failureBackoff <= 0 {
 		o.failureBackoff = DefaultFailureBackoff
+	}
+	if o.idleRelease == 0 {
+		o.idleRelease = DefaultIdleRelease
 	}
 	if o.clock == nil {
 		o.clock = time.Now
@@ -299,21 +320,38 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 }
 
 // liveIntakeSessions counts the sessions that still occupy a concurrency slot:
-// started from an issue, not yet terminated, and not already parked on an open
-// pull request.
+// started from an issue, not yet terminated, not parked on an open pull
+// request, and showing at least some sign of life.
 //
 // The PR test is what keeps the conveyor moving. A session that opened its PR
 // is waiting on a human review-and-merge, which can take hours or days; counting
 // it as busy meant a cap of N stalled the whole board after N cards, with every
 // agent idle. Merged and closed PRs do not park a session: there the agent is
 // either done (and about to be torn down) or back at work on the same issue.
+//
+// The idle test is the other half of the same problem, and it cost a day to
+// find. A session that has gone quiet — no hook callback, no activity — is not
+// spending the tokens the cap protects, yet it held the queue forever: nothing
+// terminates such a session on its own. Measured 2026-09-22: restarting the
+// conveyor restored every pane, the agents came back sitting at an EMPTY
+// PROMPT (status `no_signal`, which means «AO cannot tell working from stuck»),
+// and two claimed cards waited behind them indefinitely while both agents did
+// nothing at all. A session with no activity stamp yet is NOT idle — it has
+// just spawned, and that is exactly when it is about to work.
 func (o *Observer) liveIntakeSessions(ctx context.Context, sessions []domain.SessionRecord) map[domain.ProjectID]int {
 	live := map[domain.ProjectID]int{}
+	now := o.clock()
 	for _, session := range sessions {
 		if session.IsTerminated || session.IssueID == "" {
 			continue
 		}
 		if o.parkedOnOpenPR(ctx, session.ID) {
+			continue
+		}
+		if o.idleRelease > 0 && !session.Activity.LastActivityAt.IsZero() &&
+			now.Sub(session.Activity.LastActivityAt) >= o.idleRelease {
+			o.logger.Debug("tracker intake: session idle, slot released",
+				"session", session.ID, "idle", now.Sub(session.Activity.LastActivityAt).Round(time.Minute))
 			continue
 		}
 		live[session.ProjectID]++
