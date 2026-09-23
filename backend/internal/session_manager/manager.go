@@ -3087,6 +3087,7 @@ func (m *Manager) buildSystemPrompt(ctx context.Context, kind domain.SessionKind
 			ProjectPath:    project.Path,
 			AgentRules:     project.Config.AgentRules,
 			AgentRulesFile: project.Config.AgentRulesFile,
+			DefaultBranch:  project.Config.WithDefaults().DefaultBranch,
 		})
 		if err != nil {
 			return "", err

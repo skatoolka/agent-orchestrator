@@ -1,8 +1,10 @@
 package sessionmanager
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -42,6 +44,49 @@ type projectRulesConfig struct {
 	ProjectPath    string
 	AgentRules     string
 	AgentRulesFile string
+	// DefaultBranch is read from git rather than the checkout when set. Empty
+	// falls back to the working tree, which is what every caller did before.
+	DefaultBranch string
+}
+
+// gitShow reads a file at a ref without touching the working tree. Replaced in
+// tests; a package-level var keeps buildProjectRules free of a git dependency
+// it would otherwise have to carry through every caller.
+var gitShow = func(dir, ref, rel string) ([]byte, error) {
+	cmd := exec.Command("git", "-C", dir, "show", ref+":"+rel)
+	var out, errBuf bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("git show %s:%s: %w: %s", ref, rel, err, strings.TrimSpace(errBuf.String()))
+	}
+	return out.Bytes(), nil
+}
+
+// readRulesFile prefers the file as it is on the default branch of the origin,
+// and falls back to the checkout.
+//
+// The checkout alone is a trap, and a quiet one. AO creates each session's
+// worktree from a fresh fetch, so agents work on current code — but the base
+// clone's own working tree is never updated by anything. Measured 2026-09-23:
+// that tree sat 1461 commits behind for six weeks, and the rules file the
+// operator had just added to the repository simply did not exist in it. Spawn
+// failed with "no such file or directory" pointing at a path that is present
+// in the repository — and the worse case is silent: an OLD rules file reads
+// fine and hands every agent instructions nobody wrote any more.
+//
+// `origin/<branch>` needs no fetch of its own here: whatever keeps session
+// worktrees current already updates that ref in the same clone.
+func readRulesFile(cfg projectRulesConfig, path, rel string) ([]byte, error) {
+	branch := strings.TrimSpace(cfg.DefaultBranch)
+	if branch != "" {
+		for _, ref := range []string{"origin/" + branch, branch} {
+			if data, err := gitShow(cfg.ProjectPath, ref, rel); err == nil {
+				return data, nil
+			}
+		}
+	}
+	return os.ReadFile(path) //nolint:gosec // path is project config validated as repo-relative
 }
 
 func buildTaskPrompt(cfg taskPromptConfig) string {
@@ -121,7 +166,7 @@ func buildProjectRules(cfg projectRulesConfig) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("agentRulesFile: %w", err)
 		}
-		data, err := os.ReadFile(path) //nolint:gosec // path is project config validated as repo-relative
+		data, err := readRulesFile(cfg, path, rel)
 		if err != nil {
 			return "", fmt.Errorf("read agentRulesFile %s: %w", rel, err)
 		}
